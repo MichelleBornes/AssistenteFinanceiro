@@ -124,11 +124,14 @@ select.field {
 .auth-switch { color:var(--text); }
 .auth-switch-link { color:var(--primary); text-decoration-thickness:1.5px; text-underline-offset:4px; }
 .auth-switch-link:hover { color:var(--primary-hover); }
-.auth-confirmation { border:1px solid var(--border-strong); border-radius:10px; background:var(--surface-muted); padding:20px; color:var(--text); }
-.auth-confirmation h3 { margin:0; font-size:16px; line-height:1.4; font-weight:700; }
+.auth-confirmation { border:1px solid #BFDBFE; border-left:4px solid #2563EB; border-radius:10px; background:#EFF6FF; padding:20px; color:#0F172A; }
+.auth-confirmation h3 { margin:0; color:#1D4ED8; font-size:16px; line-height:1.4; font-weight:700; }
 .auth-confirmation p { margin:10px 0 0; color:var(--muted); font-size:13px; line-height:1.55; }
 .auth-confirmation strong { color:var(--text); overflow-wrap:anywhere; }
 .auth-confirmation .btn { margin-top:16px; }
+:root[data-theme="dark"] .auth-confirmation { border-color:#1D4ED8; border-left-color:#60A5FA; background:#172554; color:#F8FAFC; }
+:root[data-theme="dark"] .auth-confirmation h3 { color:#BFDBFE; }
+:root[data-theme="dark"] .auth-confirmation strong { color:#F8FAFC; }
 .muted { color:var(--muted); }
 .tabular-nums,td { font-variant-numeric:tabular-nums; }
 table { border-collapse:collapse; }

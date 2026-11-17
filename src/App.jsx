@@ -468,11 +468,14 @@ function AuthScreen({configured,theme,onToggleTheme}){
     event.preventDefault();setMessage('');setBusy(true)
     try{
       const result=isSignup
-        ?await supabase.auth.signUp({email:email.trim(),password})
+        ?await supabase.auth.signUp({email:email.trim(),password,options:{emailRedirectTo:window.location.origin}})
         :await supabase.auth.signInWithPassword({email:email.trim(),password})
       if(result.error)throw result.error
       if(isSignup&&!result.data.session){setConfirmationEmail(email.trim());setMode('login')}
-    }catch(error){setMessage(error.message||'Não foi possível autenticar. Confira os dados e tente novamente.')}
+    }catch(error){
+      if(error.code==='over_email_send_rate_limit'||/email rate limit exceeded/i.test(error.message||''))setMessage('O limite de envio de e-mails do Supabase foi atingido. Aguarde o limite renovar ou configure um servidor SMTP próprio para continuar os cadastros.')
+      else setMessage(error.message||'Não foi possível autenticar. Confira os dados e tente novamente.')
+    }
     finally{setBusy(false)}
   }
   return <main className="min-h-screen grid place-items-center px-5 py-10">
