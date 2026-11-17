@@ -110,6 +110,9 @@ svg.lucide { stroke-width:1.75; }
 .btn-light:hover { background:var(--surface-muted); border-color:var(--border-strong); }
 .btn-danger { color:var(--text); background:transparent; border-color:var(--border-strong); }
 .btn-primary svg,.btn-light svg { flex:none; }
+.auth-switch { color:var(--text); }
+.auth-switch-link { color:var(--primary); text-decoration-thickness:1.5px; text-underline-offset:4px; }
+.auth-switch-link:hover { color:var(--primary-hover); }
 .muted { color:var(--muted); }
 .tabular-nums,td { font-variant-numeric:tabular-nums; }
 table { border-collapse:collapse; }
