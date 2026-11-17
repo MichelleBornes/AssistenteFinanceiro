@@ -9,7 +9,7 @@ import {
   Upload, X, Pencil, Sun, Moon, LogOut, Cloud, LoaderCircle
 } from 'lucide-react'
 import { supabase, supabaseConfigured } from './lib/supabase'
-import { emptyFinanceData, importLegacyData, initializeFinanceData, loadFinanceData, syncFinanceData } from './lib/cloudStore'
+import { emptyFinanceData, importLegacyData, initializeFinanceData, loadFinanceData, removeLegacyDemoBatch, syncFinanceData } from './lib/cloudStore'
 
 const STORAGE = 'meu-financeiro-v1'
 const BANKS = [
@@ -132,6 +132,9 @@ export default function App(){
       try{
         let remote=await loadFinanceData(userId)
         if(!active||loadId!==activeLoad.current)return
+        const cleanup=await removeLegacyDemoBatch(userId,remote)
+        remote=cleanup.data
+        if(cleanup.removed)setToast(`${cleanup.removed} registros de demonstração antigos foram apagados.`)
         if(!remote.hasCloudData){
           let raw=''
           try{raw=localStorage.getItem(STORAGE)||''}catch{}

@@ -6,6 +6,20 @@ const BANKS = [
   { id:'picpay', name:'PicPay', color:'#11C76F', secondary:'#11C76F', accountLabel:'Carteira/Pix' },
   { id:'bb', name:'Banco do Brasil', color:'#0038A8', secondary:'#F8D117', accountLabel:'Conta/Pix' }
 ]
+const LEGACY_DEMO_EXAMPLES = [
+  ['Almoço executivo',42,'Alimentação','nubank','debit'],
+  ['Mercado da semana',186.4,'Compras','picpay','debit'],
+  ['Uber',23.9,'Transporte','santander','credit'],
+  ['Farmácia',57.8,'Saúde','bb','debit'],
+  ['Streaming',39.9,'Lazer','nubank','credit'],
+  ['Conta de internet',109.9,'Contas','santander','debit'],
+  ['Jantar',78,'Alimentação','picpay','credit'],
+  ['Tênis',219.9,'Compras','bb','credit'],
+  ['Ônibus e metrô',24,'Transporte','nubank','debit'],
+  ['Cinema',64,'Lazer','santander','credit'],
+  ['Mercado',132.5,'Compras','picpay','debit'],
+  ['Consulta',160,'Saúde','bb','credit']
+]
 const currentMonth = () => {
   const date = new Date()
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`
@@ -73,6 +87,59 @@ export async function loadFinanceData(userId) {
       createdAt: row.created_at ? new Date(row.created_at).getTime() : Date.now()
     }))
   }
+}
+
+function demoSignature(row) {
+  return [String(row.date).slice(0,10),row.description,Math.round(Number(row.amount)*100),row.category,row.bank,row.method].join('|')
+}
+
+function legacyDemoSignatures(anchorMonth) {
+  const [anchorYear,anchorMonthNumber]=anchorMonth.split('-').map(Number)
+  const signatures=[]
+  for(let offset=0;offset<3;offset++){
+    const first=new Date(Date.UTC(anchorYear,anchorMonthNumber-1-offset,1))
+    const year=first.getUTCFullYear(),month=first.getUTCMonth()
+    const lastDay=new Date(Date.UTC(year,month+1,0)).getUTCDate()
+    for(const [index,[description,baseAmount,category,bank,method]] of LEGACY_DEMO_EXAMPLES.entries()){
+      const day=Math.min(Math.max(2,27-index*2),lastDay)
+      const date=`${year}-${String(month+1).padStart(2,'0')}-${String(day).padStart(2,'0')}`
+      signatures.push([date,description,Math.round((baseAmount+offset*3.2)*100),category,bank,method].join('|'))
+    }
+  }
+  return signatures
+}
+
+export async function removeLegacyDemoBatch(userId, data) {
+  const transactions=data.transactions||[]
+  if(transactions.length<30)return {data,removed:0}
+  const anchors=[...new Set(transactions.map(row=>String(row.date).slice(0,7)))]
+  const ordered=transactions.map(row=>({...row,_time:new Date(row.created_at||row.createdAt||0).getTime()}))
+    .filter(row=>Number.isFinite(row._time)).sort((a,b)=>a._time-b._time)
+  let best=[]
+  for(const anchor of anchors){
+    const expected=new Set(legacyDemoSignatures(anchor))
+    for(let startIndex=0;startIndex<ordered.length;startIndex++){
+      const start=ordered[startIndex]
+      const window=[]
+      for(let index=startIndex;index<ordered.length&&ordered[index]._time<=start._time+15000;index++)window.push(ordered[index])
+      const matches=[]
+      const unmatched=new Set(expected)
+      for(const row of window){
+        const signature=demoSignature(row)
+        if(unmatched.delete(signature))matches.push(row)
+      }
+      if(matches.length>best.length)best=matches
+      if(best.length===36)break
+    }
+    if(best.length===36)break
+  }
+  // Exigir pelo menos 30 das 36 linhas e o mesmo lote de criação evita confundir
+  // gastos reais isolados com os registros gerados pela antiga demonstração.
+  if(best.length<30)return {data,removed:0}
+  const ids=best.map(row=>String(row.id))
+  const {error}=await supabase.from('transactions').delete().eq('user_id',userId).in('id',ids)
+  if(error)throw error
+  return {data:await loadFinanceData(userId),removed:ids.length}
 }
 
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b)
