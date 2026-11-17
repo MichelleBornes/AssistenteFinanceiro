@@ -209,7 +209,12 @@ export async function fetchUserLinks() {
 
 export async function requestUserLink(email) {
   const {data,error}=await supabase.rpc('request_user_link',{target_email:email.trim()})
-  if(error)throw error
+  if(error){
+    if(error.code==='PGRST202'||/schema cache|could not find the function/i.test(error.message||'')){
+      throw new Error('O banco Supabase ainda não foi atualizado para convites. Execute supabase/migrations/20261117_request_user_link.sql no SQL Editor do projeto e tente novamente.')
+    }
+    throw error
+  }
   return data?.[0]
 }
 

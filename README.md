@@ -11,6 +11,8 @@ Aplicação web em React e Vite com sincronização de dados e autenticação pe
 5. No painel de autenticação, habilite e-mail/senha. O login Google é opcional e precisa ser habilitado em **Authentication → Providers → Google**, com as URLs de callback indicadas pelo Supabase.
 6. Reinicie o servidor Vite após alterar `.env`.
 
+Se o projeto Supabase já estava configurado antes do recurso de divisão de contas, execute os arquivos de migração necessários em `supabase/migrations/` no SQL Editor para atualizar as funções de convite sem apagar os dados existentes.
+
 Use apenas a chave pública `anon`/`publishable` no navegador. Nunca coloque a chave `service_role` em variáveis `VITE_` ou no código cliente. Para publicar o app, configure as duas variáveis `VITE_SUPABASE_*` também no serviço de hospedagem.
 
 ## Executar

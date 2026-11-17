@@ -326,3 +326,5 @@ $$;
 drop trigger if exists user_link_changes on public.user_links;
 create trigger user_link_changes after insert or update or delete on public.user_links
   for each row execute function public.broadcast_user_link_change();
+
+notify pgrst, 'reload schema';
