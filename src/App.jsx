@@ -462,6 +462,7 @@ function AuthScreen({configured,theme,onToggleTheme}){
   const [password,setPassword]=useState('')
   const [busy,setBusy]=useState(false)
   const [message,setMessage]=useState('')
+  const [confirmationEmail,setConfirmationEmail]=useState('')
   const isSignup=mode==='signup'
   async function submit(event){
     event.preventDefault();setMessage('');setBusy(true)
@@ -470,7 +471,7 @@ function AuthScreen({configured,theme,onToggleTheme}){
         ?await supabase.auth.signUp({email:email.trim(),password})
         :await supabase.auth.signInWithPassword({email:email.trim(),password})
       if(result.error)throw result.error
-      if(isSignup&&!result.data.session)setMessage('Conta criada. Confirme seu e-mail para concluir o cadastro e entrar.')
+      if(isSignup&&!result.data.session){setConfirmationEmail(email.trim());setMode('login')}
     }catch(error){setMessage(error.message||'Não foi possível autenticar. Confira os dados e tente novamente.')}
     finally{setBusy(false)}
   }
@@ -479,8 +480,16 @@ function AuthScreen({configured,theme,onToggleTheme}){
       <div className="flex items-start justify-between mb-8"><div><div className="text-[10px] font-bold tracking-[.2em] muted uppercase">Finanças pessoais</div><h1 className="font-bold tracking-tight text-2xl mt-1" style={{fontFamily:'Manrope'}}>meu financeiro</h1></div><button type="button" className="btn btn-light !p-2" onClick={onToggleTheme} aria-label={theme==='dark'?'Ativar modo claro':'Ativar modo escuro'}>{theme==='dark'?<Sun size={17} strokeWidth={1.75}/>:<Moon size={17} strokeWidth={1.75}/>}</button></div>
       <section className="card p-6 sm:p-8">
         <div className="mb-6"><p className="text-xs uppercase tracking-[.16em] muted mb-2">Acesso seguro</p><h2 className="text-xl font-bold" style={{fontFamily:'Manrope'}}>{configured?(isSignup?'Criar sua conta':'Entrar na sua conta'):'Conecte seu projeto Supabase'}</h2><p className="text-sm muted mt-2">{configured?'Acesse seus dados financeiros em todos os seus dispositivos.':'Adicione as credenciais públicas do projeto para ativar o acesso.'}</p></div>
-        {!configured?<div className="space-y-3 text-sm"><p>Crie um arquivo <code>.env</code> baseado em <code>.env.example</code> e preencha <code>VITE_SUPABASE_URL</code> e <code>VITE_SUPABASE_ANON_KEY</code>. Depois execute o SQL de <code>supabase/schema.sql</code> no editor SQL do projeto.</p><p className="muted text-xs">Use somente a chave pública anon/publishable no navegador. A chave service_role não deve ser colocada no app.</p></div>:
-          <><form onSubmit={submit} className="space-y-4"><label className="block text-xs font-semibold">E-mail<input className="field mt-1.5" type="email" autoComplete="email" required value={email} onChange={event=>setEmail(event.target.value)} placeholder="voce@exemplo.com"/></label><label className="block text-xs font-semibold">Senha<input className="field mt-1.5" type="password" autoComplete={isSignup?'new-password':'current-password'} minLength={6} required value={password} onChange={event=>setPassword(event.target.value)} placeholder="Mínimo de 6 caracteres"/></label><button className="btn btn-primary w-full justify-center" disabled={busy}>{busy&&<LoaderCircle size={15} className="animate-spin"/>}{isSignup?'Criar conta':'Entrar'}</button></form><p className="auth-switch text-center text-sm mt-5">{isSignup?'Já tem uma conta?':'Ainda não tem conta?'} <button className="auth-switch-link font-bold underline underline-offset-4" onClick={()=>{setMode(isSignup?'login':'signup');setMessage('')}}>{isSignup?'Entrar':'Criar conta'}</button></p></>}
+        {!configured ? (
+          <div className="space-y-3 text-sm"><p>Crie um arquivo <code>.env</code> baseado em <code>.env.example</code> e preencha <code>VITE_SUPABASE_URL</code> e <code>VITE_SUPABASE_ANON_KEY</code>. Depois execute o SQL de <code>supabase/schema.sql</code> no editor SQL do projeto.</p><p className="muted text-xs">Use somente a chave pública anon/publishable no navegador. A chave service_role não deve ser colocada no app.</p></div>
+        ) : confirmationEmail ? (
+          <div className="auth-confirmation" role="status" aria-live="polite"><h3>Confirme seu e-mail para ativar a conta</h3><p>Enviamos um link de confirmação para <strong>{confirmationEmail}</strong>. Abra essa mensagem e clique no link antes de entrar.</p><p>Não encontrou? Confira também a pasta de spam ou lixo eletrônico.</p><button type="button" className="btn btn-primary w-full justify-center" onClick={()=>setConfirmationEmail('')}>Ir para entrar</button></div>
+        ) : (
+          <>
+            <form onSubmit={submit} className="space-y-4"><label className="block text-xs font-semibold">E-mail<input className="field mt-1.5" type="email" autoComplete="email" required value={email} onChange={event=>setEmail(event.target.value)} placeholder="voce@exemplo.com"/></label><label className="block text-xs font-semibold">Senha<input className="field mt-1.5" type="password" autoComplete={isSignup?'new-password':'current-password'} minLength={6} required value={password} onChange={event=>setPassword(event.target.value)} placeholder="Mínimo de 6 caracteres"/></label><button className="btn btn-primary w-full justify-center" disabled={busy}>{busy&&<LoaderCircle size={15} className="animate-spin"/>}{isSignup?'Criar conta':'Entrar'}</button></form>
+            <p className="auth-switch text-center text-sm mt-5">{isSignup?'Já tem uma conta?':'Ainda não tem conta?'} <button className="auth-switch-link font-bold underline underline-offset-4" onClick={()=>{setMode(isSignup?'login':'signup');setMessage('')}}>{isSignup?'Entrar':'Criar conta'}</button></p>
+          </>
+        )}
         {message&&<p role="status" className="mt-4 rounded-lg border border-slate-200 p-3 text-sm muted">{message}</p>}
       </section>
       <p className="text-center text-[11px] muted mt-5">Os dados são privados e associados à sua conta.</p>
