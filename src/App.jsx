@@ -6,7 +6,7 @@ import {
 import {
   ArrowUpRight, CalendarDays, Check, ChevronLeft, ChevronRight, Download,
   FileDown, LayoutDashboard, Plus, Search, Settings2, ShieldCheck, Trash2,
-  Upload, X, Pencil, RotateCcw, Sun, Moon, LogOut, Cloud, LoaderCircle
+  Upload, X, Pencil, Sun, Moon, LogOut, Cloud, LoaderCircle
 } from 'lucide-react'
 import { supabase, supabaseConfigured } from './lib/supabase'
 import { emptyFinanceData, importLegacyData, initializeFinanceData, loadFinanceData, syncFinanceData } from './lib/cloudStore'
@@ -41,36 +41,6 @@ const uid = () => Math.random().toString(36).slice(2,10)
 const today = new Date()
 const currentKey = dateISO(today).slice(0,7)
 
-function sampleData(){
-  const transactions=[]
-  const examples=[
-    [-2,'Almoço executivo',42,'Alimentação','nubank','debit'],
-    [-3,'Mercado da semana',186.4,'Compras','picpay','debit'],
-    [-4,'Uber',23.9,'Transporte','santander','credit'],
-    [-5,'Farmácia',57.8,'Saúde','bb','debit'],
-    [-7,'Streaming',39.9,'Lazer','nubank','credit'],
-    [-9,'Conta de internet',109.9,'Contas','santander','debit'],
-    [-11,'Jantar',78,'Alimentação','picpay','credit'],
-    [-13,'Tênis',219.9,'Compras','bb','credit'],
-    [-15,'Ônibus e metrô',24,'Transporte','nubank','debit'],
-    [-18,'Cinema',64,'Lazer','santander','credit'],
-    [-20,'Mercado',132.5,'Compras','picpay','debit'],
-    [-22,'Consulta',160,'Saúde','bb','credit']
-  ]
-  for(let m=0;m<3;m++){
-    const ref=new Date(today.getFullYear(),today.getMonth()-m,1)
-    examples.forEach((e,i)=>{
-      const d=new Date(ref.getFullYear(),ref.getMonth(),Math.min(Math.max(2,27-i*2),new Date(ref.getFullYear(),ref.getMonth()+1,0).getDate()))
-      transactions.push({id:uid(),date:dateISO(d),description:e[1],amount:e[2]+(m*3.2),category:e[3],bank:e[4],method:e[5],createdAt:Date.now()})
-    })
-  }
-  return {
-    version:1, demo:true,
-    settings:{monthlyBudget:3200,cycleDay:1,dailySafetyThreshold:40},
-    banks:BANKS.map((b,i)=>({...b,accountBalance:[1850,920,640,2300][i],creditLimit:[2500,1800,1200,3000][i]})),
-    transactions
-  }
-}
 const methodLabel=m=>m==='credit'?'Crédito':'Débito/Pix'
 const bankName=id=>BANKS.find(b=>b.id===id)?.name || id
 
@@ -247,11 +217,11 @@ export default function App(){
     const rows=installmentCount>1?createInstallments(tx,installmentCount):[{...tx,id:uid(),createdAt:Date.now()}]
     const monthBudgets={...(data.monthBudgets||{})}
     rows.forEach(row=>{monthBudgets[monthKey(row.date)]??=data.settings.monthlyBudget})
-    commitData({...data,demo:false,monthBudgets,transactions:[...rows,...data.transactions]})
+    commitData({...data,monthBudgets,transactions:[...rows,...data.transactions]})
     notify(installmentCount>1?`Compra parcelada em ${installmentCount}x registrada.`:'Gasto registrado com sucesso.')
   }
   function saveTransaction(tx){
-    if(editing){commitData({...data,demo:false,monthBudgets:{...(data.monthBudgets||{}),[monthKey(tx.date)]:data.monthBudgets?.[monthKey(tx.date)]??data.settings.monthlyBudget},transactions:data.transactions.map(t=>t.id===editing.id?{...tx,id:editing.id}:t)});notify('Transação atualizada.')}
+    if(editing){commitData({...data,monthBudgets:{...(data.monthBudgets||{}),[monthKey(tx.date)]:data.monthBudgets?.[monthKey(tx.date)]??data.settings.monthlyBudget},transactions:data.transactions.map(t=>t.id===editing.id?{...tx,id:editing.id}:t)});notify('Transação atualizada.')}
     else addTransaction(tx)
     setModal(null);setEditing(null)
   }
@@ -262,12 +232,12 @@ export default function App(){
     const target=data.transactions.find(t=>t.id===id)
     if(target?.installmentGroup){setDeleteTarget(target);setModal('delete-installment');return}
     if(!confirm('Excluir esta transação?'))return
-    commitData({...data,demo:false,transactions:data.transactions.filter(t=>t.id!==id)});notify('Transação excluída.')
+    commitData({...data,transactions:data.transactions.filter(t=>t.id!==id)});notify('Transação excluída.')
   }
   function removeInstallments(mode){
     if(!deleteTarget)return
     const target=deleteTarget
-    commitData({...data,demo:false,transactions:data.transactions.filter(t=>t.installmentGroup!==target.installmentGroup||(mode==='future'&&t.installmentNumber<target.installmentNumber))})
+    commitData({...data,transactions:data.transactions.filter(t=>t.installmentGroup!==target.installmentGroup||(mode==='future'&&t.installmentNumber<target.installmentNumber))})
     setDeleteTarget(null);setModal(null)
     notify(mode==='future'?'Esta parcela e as próximas foram excluídas.':'Parcela excluída.')
   }
@@ -276,7 +246,6 @@ export default function App(){
   function downloadBlob(blob,name){const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=name;a.click();URL.revokeObjectURL(url)}
   function exportCSV(){const rows=[['Data','Descrição','Categoria','Banco','Método','Valor'],...selected.map(t=>[t.date,t.description,t.category,bankName(t.bank),methodLabel(t.method),t.amount])];const csv=rows.map(r=>r.map(v=>`"${String(v??'').replaceAll('"','""')}"`).join(';')).join('\\n');downloadBlob(new Blob(['\\ufeff'+csv],{type:'text/csv;charset=utf-8'}),`transacoes-${period}.csv`)}
   function restoreFile(e){const f=e.target.files?.[0];if(!f)return;const r=new FileReader();r.onload=()=>{try{const d=JSON.parse(r.result);if(d.version!==1||!Array.isArray(d.transactions)||!Array.isArray(d.banks))throw Error();commitData(d);setPeriod(currentKey);notify('Backup enviado para a nuvem.')}catch{notify('Arquivo inválido ou incompatível.')}};r.readAsText(f);e.target.value=''}
-  function resetDemo(){if(!confirm('Isso substitui os dados atuais pelos dados fictícios iniciais. Continuar?'))return;const d=sampleData();commitData(d);setPeriod(currentKey);notify('Dados de demonstração restaurados.')}
   function saveSettings(next){commitData(next);notify('Configurações salvas na nuvem.')}
   const filtered=monthTransactions.filter(t=>(filters.bank==='all'||t.bank===filters.bank)&&(filters.method==='all'||t.method===filters.method)&&(filters.category==='all'||t.category===filters.category)&&(!filters.search||t.description.toLowerCase().includes(filters.search.toLowerCase())))
   const bankSummary=BANKS.map(b=>({...b,color:bankAccent(b.id,theme),debit:monthTransactions.filter(t=>t.bank===b.id&&t.method==='debit').reduce((s,t)=>s+t.amount,0),credit:monthTransactions.filter(t=>t.bank===b.id&&t.method==='credit').reduce((s,t)=>s+t.amount,0)}))
@@ -326,7 +295,7 @@ export default function App(){
         <div className="md:text-right"><div className="text-[11px] uppercase tracking-wider font-bold text-slate-500">{selectedMonth===currentKey?'Pode gastar hoje':'Meta diária deste mês'}</div><div className={`budget-value status-${dailyTone} text-2xl font-extrabold tracking-tight`} style={{fontFamily:'Manrope'}}>{money(canSpend)}</div><div className="text-[11px] text-slate-500">Meta diária recalculada: {money(Math.max(0,daily))}</div></div>
       </div>
 
-      {tab==='settings'?<Settings data={data} onSave={saveSettings} notify={notify} resetDemo={resetDemo} theme={theme}/>:
+      {tab==='settings'?<Settings data={data} onSave={saveSettings} theme={theme}/>:
       <>{tab==='dashboard'&&<>
         <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-4 mb-5">
           <Kpi title="Gasto no período" value={money(total)} note={period==='all'?'Somatório de todos os meses':`Orçamento: ${money(selectedBudget)}`}/>
@@ -348,7 +317,7 @@ export default function App(){
         <div className="overflow-x-auto"><table className="w-full text-left min-w-[700px]"><thead><tr className="text-[10px] uppercase tracking-wider muted border-b border-slate-100"><th className="py-3 font-semibold">Descrição</th><th className="py-3 font-semibold">Data</th><th className="py-3 font-semibold">Instituição</th><th className="py-3 font-semibold">Método</th><th className="py-3 font-semibold text-right">Valor</th><th className="py-3"></th></tr></thead><tbody>{filtered.slice(0,tab==='dashboard'?8:filtered.length).map(t=><tr key={t.id} className="border-b border-slate-50 last:border-0 hover:bg-slate-50/70"><td className="py-3"><div className="font-semibold text-sm">{t.description}</div><div className="text-[11px] muted">{t.category}{t.installmentCount>1&&<span className="ml-2 inline-flex rounded-md bg-violet-50 px-2 py-0.5 font-semibold text-violet-700">Parcela {t.installmentNumber}/{t.installmentCount}</span>}</div></td><td className="py-3 text-xs text-slate-500">{new Date(t.date+'T12:00:00').toLocaleDateString('pt-BR')}</td><td className="py-3"><span className="inline-flex items-center gap-2 text-xs font-semibold"><span className="w-2 h-2 rounded-full" style={{background:bankAccent(t.bank,theme)}}/>{data.banks.find(b=>b.id===t.bank)?.name||bankName(t.bank)}</span></td><td className="py-3"><span className={`text-[10px] font-bold px-2 py-1 rounded-md ${t.method==='credit'?'bg-blue-50 text-blue-700':'bg-emerald-50 text-emerald-700'}`}>{methodLabel(t.method)}</span></td><td className="py-3 text-right text-sm font-bold">{money(t.amount)}</td><td className="py-3 text-right"><button title="Editar" onClick={()=>{setEditing(t);setModal('transaction')}} className="p-2 text-slate-400 hover:text-violet-700"><Pencil size={14}/></button><button title="Excluir" onClick={()=>removeTransaction(t.id)} className="p-2 text-slate-400 hover:text-rose-600"><Trash2 size={14}/></button></td></tr>)}</tbody></table>{!filtered.length&&<div className="py-12 text-center text-sm muted">Nenhuma transação encontrada com esses filtros.</div>}</div>
       </section>
       </>}
-      <footer className="flex flex-col sm:flex-row justify-between gap-2 py-6 text-[11px] muted"><span>{syncError?`Erro de sincronização: ${syncError}`:syncState==='synced'?'Dados sincronizados com segurança na nuvem.':'Salvando alterações na nuvem…'}</span><div className="flex gap-3"><button onClick={exportJSON} className="hover:text-violet-700">Backup (JSON)</button><button onClick={resetDemo} className="hover:text-violet-700">Zerar dados de exemplo</button></div></footer>
+      <footer className="flex flex-col sm:flex-row justify-between gap-2 py-6 text-[11px] muted"><span>{syncError?`Erro de sincronização: ${syncError}`:syncState==='synced'?'Dados sincronizados com segurança na nuvem.':'Salvando alterações na nuvem…'}</span><div className="flex gap-3"><button onClick={exportJSON} className="hover:text-violet-700">Backup (JSON)</button></div></footer>
     </main>
     {modal==='transaction'&&<TransactionModal banks={data.banks} initial={editing} onClose={()=>{setModal(null);setEditing(null)}} onSave={saveTransaction}/>}
     {modal==='delete-installment'&&deleteTarget&&<div className="fixed inset-0 z-50 bg-slate-900/30 grid place-items-center p-4"><div className="card w-full max-w-md p-6"><h2 className="text-lg font-extrabold" style={{fontFamily:'Manrope'}}>Excluir compra parcelada</h2><p className="text-sm muted mt-2 mb-5">Esta é a parcela {deleteTarget.installmentNumber}/{deleteTarget.installmentCount} de “{deleteTarget.description}”. O que deseja apagar?</p><div className="flex flex-col gap-2"><button className="btn btn-light" onClick={()=>removeInstallments('current')}>Apenas esta parcela</button><button className="btn btn-primary" onClick={()=>removeInstallments('future')}>Esta e todas as parcelas futuras</button><button className="btn btn-light mt-1" onClick={()=>{setDeleteTarget(null);setModal(null)}}>Cancelar</button></div></div></div>}
@@ -408,12 +377,12 @@ function TransactionModal({banks,initial,onClose,onSave}){
   return <div className="fixed inset-0 z-50 bg-slate-900/30 grid place-items-center p-4" onMouseDown={e=>{if(e.target===e.currentTarget)onClose()}}><form onSubmit={submit} className="bg-white rounded-2xl shadow-2xl w-full max-w-lg p-6"><div className="flex justify-between items-center mb-5"><div><h2 className="text-lg font-extrabold" style={{fontFamily:'Manrope'}}>{initial?'Editar gasto':'Novo gasto'}</h2><p className="text-xs muted mt-1">Preencha os dados da movimentação.</p></div><button type="button" onClick={onClose} className="p-2 text-slate-400"><X size={19}/></button></div><div className="grid grid-cols-2 gap-3"><label className="col-span-2 text-xs font-semibold text-slate-600">Descrição<input required className="field mt-1.5" placeholder="Ex.: Almoço" value={form.description} onChange={e=>update('description',e.target.value)}/></label><label className="text-xs font-semibold text-slate-600">Valor total da compra (R$)<input required min="0.01" step="0.01" type="number" className="field mt-1.5" placeholder="0,00" value={form.amount} onChange={e=>update('amount',e.target.value)}/></label><label className="text-xs font-semibold text-slate-600">Data<input required type="date" className="field mt-1.5" value={form.date} onChange={e=>update('date',e.target.value)}/></label><label className="text-xs font-semibold text-slate-600">Categoria<select className="field mt-1.5" value={form.category} onChange={e=>update('category',e.target.value)}>{CATEGORIES.map(c=><option key={c}>{c}</option>)}</select></label><label className="text-xs font-semibold text-slate-600">Instituição<select className="field mt-1.5" value={form.bank} onChange={e=>update('bank',e.target.value)}>{BANKS.map(b=><option key={b.id} value={b.id}>{b.name}</option>)}</select></label><label className="col-span-2 text-xs font-semibold text-slate-600">Forma de pagamento<div className="grid grid-cols-2 gap-2 mt-1.5"><button type="button" onClick={()=>update('method','debit')} className={`p-3 rounded-xl border text-sm font-semibold ${form.method==='debit'?'border-violet-400 bg-violet-50 text-violet-700':'border-slate-200 text-slate-500'}`}>Débito / Pix</button><button type="button" onClick={()=>update('method','credit')} className={`p-3 rounded-xl border text-sm font-semibold ${form.method==='credit'?'border-violet-400 bg-violet-50 text-violet-700':'border-slate-200 text-slate-500'}`}>Crédito</button></div></label>{form.method==='credit'&&<label className="col-span-2 text-xs font-semibold text-slate-600">Número de parcelas<select className="field mt-1.5" value={form.installmentCount} disabled={Boolean(initial?.installmentGroup)} onChange={e=>update('installmentCount',Number(e.target.value))}>{Array.from({length:24},(_,i)=><option key={i+1} value={i+1}>{i+1}x</option>)}</select>{initial?.installmentGroup&&<span className="block mt-1 font-normal muted">Esta compra já possui parcelas vinculadas.</span>}</label>}</div><div className="flex justify-end gap-2 mt-6"><button type="button" onClick={onClose} className="btn btn-light">Cancelar</button><button className="btn btn-primary" type="submit"><Check size={15}/>Salvar gasto</button></div></form></div>
 }
 
-function Settings({data,onSave,notify,resetDemo,theme}){
+function Settings({data,onSave,theme}){
   const [budget,setBudget]=useState(data.settings.monthlyBudget)
   const [dailySafetyThreshold,setDailySafetyThreshold]=useState(data.settings.dailySafetyThreshold??40)
   const [banks,setBanks]=useState(data.banks)
   const [newBank,setNewBank]=useState('')
-  function save(){onSave({...data,demo:false,settings:{...data.settings,monthlyBudget:Number(budget),dailySafetyThreshold:Math.max(0,Number(dailySafetyThreshold)||0)},monthBudgets:{...(data.monthBudgets||{}),[dateISO(new Date()).slice(0,7)]:Number(budget)},banks})}
+  function save(){onSave({...data,settings:{...data.settings,monthlyBudget:Number(budget),dailySafetyThreshold:Math.max(0,Number(dailySafetyThreshold)||0)},monthBudgets:{...(data.monthBudgets||{}),[dateISO(new Date()).slice(0,7)]:Number(budget)},banks})}
   function addBank(){if(!newBank.trim())return;const id='custom-'+uid();setBanks(b=>[...b,{id,name:newBank.trim(),color:'#9CA3AF',secondary:'#9CA3AF',accountLabel:'Conta/Pix',accountBalance:0,creditLimit:0}]);setNewBank('')}
-  return <div className="max-w-4xl space-y-5"><div className="card p-5"><h2 className="font-bold text-lg" style={{fontFamily:'Manrope'}}>Orçamento mensal</h2><p className="text-xs muted mt-1 mb-4">A meta diária considera os gastos do mês selecionado e o limite mínimo definido aqui.</p><div className="grid sm:grid-cols-2 gap-4"><label className="text-xs font-semibold text-slate-600">Orçamento total mensal (R$)<input type="number" min="0" step=".01" className="field mt-1.5" value={budget} onChange={e=>setBudget(e.target.value)}/></label><label className="text-xs font-semibold text-slate-600">Alerta vermelho abaixo de (R$/dia)<input type="number" min="0" step=".01" className="field mt-1.5" value={dailySafetyThreshold} onChange={e=>setDailySafetyThreshold(e.target.value)}/><span className="block mt-1 font-normal muted">A meta fica vermelha quando cair abaixo deste valor.</span></label></div></div><div className="card p-5"><h2 className="font-bold text-lg" style={{fontFamily:'Manrope'}}>Contas e cartões</h2><p className="text-xs muted mt-1 mb-4">Defina o saldo inicial das contas e o limite de cada cartão.</p><div className="space-y-3">{banks.map((b,i)=><div key={b.id} className="rounded-xl border border-slate-100 p-4"><div className="flex items-center gap-2 mb-3"><span className="w-3 h-3 rounded-full" style={{background:bankAccent(b.id,theme)}}/><span className="font-bold text-sm">{b.name}</span>{i<4&&<span className="text-[10px] bg-slate-100 px-2 py-1 rounded-md muted">Pré-cadastrado</span>}</div><div className="grid sm:grid-cols-2 gap-3"><label className="text-xs font-semibold text-slate-600">Saldo inicial da conta (R$)<input type="number" step=".01" className="field mt-1.5" value={b.accountBalance??0} onChange={e=>setBanks(bs=>bs.map(x=>x.id===b.id?{...x,accountBalance:Number(e.target.value)}:x))}/></label><label className="text-xs font-semibold text-slate-600">Limite do cartão (R$)<input type="number" step=".01" className="field mt-1.5" value={b.creditLimit??0} onChange={e=>setBanks(bs=>bs.map(x=>x.id===b.id?{...x,creditLimit:Number(e.target.value)}:x))}/></label></div></div>)}</div><div className="flex gap-2 mt-4"><input className="field" placeholder="Nome da nova instituição" value={newBank} onChange={e=>setNewBank(e.target.value)}/><button onClick={addBank} className="btn btn-light whitespace-nowrap"><Plus size={15}/>Adicionar</button></div></div><div className="flex flex-wrap gap-2"><button onClick={save} className="btn btn-primary"><Check size={15}/>Salvar configurações</button><button onClick={resetDemo} className="btn btn-light"><RotateCcw size={15}/>Zerar dados de exemplo</button></div><div className="rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 p-4 text-xs leading-relaxed"><ShieldCheck size={16} className="inline mr-2"/>Seus dados são sincronizados com sua conta Supabase. CSV e JSON ficam disponíveis para exportação manual.</div></div>
+  return <div className="max-w-4xl space-y-5"><div className="card p-5"><h2 className="font-bold text-lg" style={{fontFamily:'Manrope'}}>Orçamento mensal</h2><p className="text-xs muted mt-1 mb-4">A meta diária considera os gastos do mês selecionado e o limite mínimo definido aqui.</p><div className="grid sm:grid-cols-2 gap-4"><label className="text-xs font-semibold text-slate-600">Orçamento total mensal (R$)<input type="number" min="0" step=".01" className="field mt-1.5" value={budget} onChange={e=>setBudget(e.target.value)}/></label><label className="text-xs font-semibold text-slate-600">Alerta vermelho abaixo de (R$/dia)<input type="number" min="0" step=".01" className="field mt-1.5" value={dailySafetyThreshold} onChange={e=>setDailySafetyThreshold(e.target.value)}/><span className="block mt-1 font-normal muted">A meta fica vermelha quando cair abaixo deste valor.</span></label></div></div><div className="card p-5"><h2 className="font-bold text-lg" style={{fontFamily:'Manrope'}}>Contas e cartões</h2><p className="text-xs muted mt-1 mb-4">Defina o saldo inicial das contas e o limite de cada cartão.</p><div className="space-y-3">{banks.map((b,i)=><div key={b.id} className="rounded-xl border border-slate-100 p-4"><div className="flex items-center gap-2 mb-3"><span className="w-3 h-3 rounded-full" style={{background:bankAccent(b.id,theme)}}/><span className="font-bold text-sm">{b.name}</span>{i<4&&<span className="text-[10px] bg-slate-100 px-2 py-1 rounded-md muted">Pré-cadastrado</span>}</div><div className="grid sm:grid-cols-2 gap-3"><label className="text-xs font-semibold text-slate-600">Saldo inicial da conta (R$)<input type="number" step=".01" className="field mt-1.5" value={b.accountBalance??0} onChange={e=>setBanks(bs=>bs.map(x=>x.id===b.id?{...x,accountBalance:Number(e.target.value)}:x))}/></label><label className="text-xs font-semibold text-slate-600">Limite do cartão (R$)<input type="number" step=".01" className="field mt-1.5" value={b.creditLimit??0} onChange={e=>setBanks(bs=>bs.map(x=>x.id===b.id?{...x,creditLimit:Number(e.target.value)}:x))}/></label></div></div>)}</div><div className="flex gap-2 mt-4"><input className="field" placeholder="Nome da nova instituição" value={newBank} onChange={e=>setNewBank(e.target.value)}/><button onClick={addBank} className="btn btn-light whitespace-nowrap"><Plus size={15}/>Adicionar</button></div></div><div className="flex flex-wrap gap-2"><button onClick={save} className="btn btn-primary"><Check size={15}/>Salvar configurações</button></div><div className="rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 p-4 text-xs leading-relaxed"><ShieldCheck size={16} className="inline mr-2"/>Seus dados são sincronizados com sua conta Supabase. CSV e JSON ficam disponíveis para exportação manual.</div></div>
 }

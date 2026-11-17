@@ -14,7 +14,6 @@ const currentMonth = () => {
 export function emptyFinanceData() {
   return {
     version: 1,
-    demo: false,
     settings: { monthlyBudget: 3200, cycleDay: 1, dailySafetyThreshold: 40 },
     monthBudgets: {},
     banks: BANKS.map(bank => ({ ...bank, accountBalance: 0, creditLimit: 0 })),
@@ -55,7 +54,6 @@ export async function loadFinanceData(userId) {
 
   return {
     version: 1,
-    demo: false,
     settings: {
       monthlyBudget: Number(preferredBudget?.monthly_budget ?? 3200),
       cycleDay: Number(preferredBudget?.closing_day ?? 1),
@@ -153,15 +151,17 @@ export async function syncFinanceData(userId, before, after) {
 }
 
 export async function importLegacyData(userId, legacyData) {
+  const isDemoBackup = legacyData.demo === true
+  const defaults = emptyFinanceData()
   const data = {
-    ...emptyFinanceData(), ...legacyData,
-    settings: { ...emptyFinanceData().settings, ...(legacyData.settings || {}) },
-    monthBudgets: legacyData.monthBudgets || {},
-    banks: (legacyData.banks || []).map(bank => {
+    ...defaults,
+    settings: isDemoBackup ? defaults.settings : { ...defaults.settings, ...(legacyData.settings || {}) },
+    monthBudgets: isDemoBackup ? {} : (legacyData.monthBudgets || {}),
+    banks: isDemoBackup ? defaults.banks : (legacyData.banks || []).map(bank => {
       const preset = BANKS.find(item => item.id === bank.id)
       return { ...bank, color: preset?.color || bank.color || '#9CA3AF', secondary: preset?.secondary || bank.secondary || '#9CA3AF' }
     }),
-    transactions: Array.isArray(legacyData.transactions) ? legacyData.transactions : []
+    transactions: isDemoBackup ? [] : (Array.isArray(legacyData.transactions) ? legacyData.transactions : [])
   }
   const baseline = emptyFinanceData()
   baseline.banks = []
