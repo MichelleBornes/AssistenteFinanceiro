@@ -37,7 +37,7 @@ export function emptyFinanceData() {
 
 export async function loadFinanceData(userId) {
   const [transactionsResult, budgetsResult, accountsResult] = await Promise.all([
-    supabase.from('transactions').select('*').eq('user_id', userId),
+    supabase.from('transactions').select('*').or(`user_id.eq.${userId},shared_with_user_id.eq.${userId}`),
     supabase.from('budgets').select('*').eq('user_id', userId),
     supabase.from('accounts').select('*').eq('user_id', userId)
   ])
@@ -76,16 +76,32 @@ export async function loadFinanceData(userId) {
     monthBudgets,
     banks,
     hasCloudData: Boolean((transactionsResult.data || []).length || budgets.length || remoteAccounts.length),
-    transactions: (transactionsResult.data || []).map(({ user_id, ...row }) => ({
-      ...row,
-      date: String(row.date).slice(0, 10),
-      amount: Number(row.amount),
-      installmentTotal: row.installment_total == null ? undefined : Number(row.installment_total),
-      installmentNumber: row.installment_number ?? undefined,
-      installmentCount: row.installment_count ?? undefined,
-      installmentGroup: row.installment_group_id ?? undefined,
-      createdAt: row.created_at ? new Date(row.created_at).getTime() : Date.now()
-    }))
+    transactions: (transactionsResult.data || []).map(row => {
+      const payerId=row.payer_id||row.user_id
+      const isPayer=payerId===userId
+      const payerShare=Number(row.payer_share??row.amount)
+      const sharedShare=Number(row.shared_share||0)
+      return {
+        ...row,
+        date: String(row.date).slice(0, 10),
+        amount: isPayer?payerShare:sharedShare,
+        transactionTotal: Number(row.amount),
+        payerShare,
+        sharedShare,
+        payerId,
+        sharedWithUserId: row.shared_with_user_id||undefined,
+        isPayer,
+        isShared: Boolean(row.shared_with_user_id),
+        isSettled: Boolean(row.settled_at),
+        settledAt: row.settled_at||undefined,
+        settledBy: row.settled_by||undefined,
+        installmentTotal: row.installment_total == null ? undefined : Number(row.installment_total),
+        installmentNumber: row.installment_number ?? undefined,
+        installmentCount: row.installment_count ?? undefined,
+        installmentGroup: row.installment_group_id ?? undefined,
+        createdAt: row.created_at ? new Date(row.created_at).getTime() : Date.now()
+      }
+    })
   }
 }
 
@@ -110,8 +126,19 @@ function legacyDemoSignatures(anchorMonth) {
 }
 
 export async function removeLegacyDemoBatch(userId, data) {
+  const oldDemoBalances={nubank:1850,santander:920,picpay:640,bb:2300}
+  const hasUntouchedDemoBalances=Object.entries(oldDemoBalances).every(([id,balance])=>
+    Number(data.banks.find(bank=>bank.id===id)?.accountBalance||0)===balance
+  )
+  if(hasUntouchedDemoBalances){
+    const updates=Object.keys(oldDemoBalances).map(id=>supabase.from('accounts').update({account_balance:0}).eq('user_id',userId).eq('id',id))
+    const results=await Promise.all(updates)
+    const updateError=results.find(result=>result.error)?.error
+    if(updateError)throw updateError
+    data=await loadFinanceData(userId)
+  }
   const transactions=data.transactions||[]
-  if(transactions.length<30)return {data,removed:0}
+  if(transactions.length<30)return {data,removed:0,balancesReset:hasUntouchedDemoBalances}
   const anchors=[...new Set(transactions.map(row=>String(row.date).slice(0,7)))]
   const ordered=transactions.map(row=>({...row,_time:new Date(row.created_at||row.createdAt||0).getTime()}))
     .filter(row=>Number.isFinite(row._time)).sort((a,b)=>a._time-b._time)
@@ -139,7 +166,7 @@ export async function removeLegacyDemoBatch(userId, data) {
   const ids=best.map(row=>String(row.id))
   const {error}=await supabase.from('transactions').delete().eq('user_id',userId).in('id',ids)
   if(error)throw error
-  return {data:await loadFinanceData(userId),removed:ids.length}
+  return {data:await loadFinanceData(userId),removed:ids.length,balancesReset:hasUntouchedDemoBalances}
 }
 
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b)
@@ -158,13 +185,37 @@ function budgetRows(data, userId) {
 }
 
 function transactionRow(item, userId) {
+  const transactionTotal=Number(item.transactionTotal??item.amount)
+  const payerShare=Number(item.payerShare??transactionTotal)
+  const sharedShare=Number(item.sharedShare??Math.max(0,transactionTotal-payerShare))
   return {
-    id: String(item.id), user_id: userId, date: item.date, description: item.description,
-    amount: Number(item.amount), category: item.category || 'Outros', bank: item.bank || 'nubank',
+    id: String(item.id), user_id: item.payerId||userId, payer_id: item.payerId||userId,
+    shared_with_user_id: item.sharedWithUserId||null,
+    payer_share: payerShare, shared_share: sharedShare,
+    settled_at: item.settledAt||null, settled_by: item.settledBy||null,
+    date: item.date, description: item.description,
+    amount: transactionTotal, category: item.category || 'Outros', bank: item.bank || 'nubank',
     method: item.method || 'debit', installment_group_id: item.installmentGroup || null,
     installment_number: item.installmentNumber ?? null, installment_count: item.installmentCount ?? null,
     installment_total: item.installmentTotal ?? null, created_at: item.createdAt ? new Date(item.createdAt).toISOString() : new Date().toISOString()
   }
+}
+
+export async function fetchUserLinks() {
+  const {data,error}=await supabase.rpc('list_user_links')
+  if(error)throw error
+  return data||[]
+}
+
+export async function requestUserLink(email) {
+  const {data,error}=await supabase.rpc('request_user_link',{target_email:email.trim()})
+  if(error)throw error
+  return data?.[0]
+}
+
+export async function acceptUserLink(code) {
+  const {error}=await supabase.rpc('accept_user_link',{code:code.trim()})
+  if(error)throw error
 }
 
 function accountRow(item, userId) {

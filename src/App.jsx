@@ -9,7 +9,7 @@ import {
   Upload, X, Pencil, Sun, Moon, LogOut, Cloud, LoaderCircle
 } from 'lucide-react'
 import { supabase, supabaseConfigured } from './lib/supabase'
-import { emptyFinanceData, importLegacyData, initializeFinanceData, loadFinanceData, removeLegacyDemoBatch, syncFinanceData } from './lib/cloudStore'
+import { acceptUserLink, emptyFinanceData, fetchUserLinks, importLegacyData, initializeFinanceData, loadFinanceData, removeLegacyDemoBatch, requestUserLink, syncFinanceData } from './lib/cloudStore'
 
 const STORAGE = 'meu-financeiro-v1'
 const BANKS = [
@@ -44,12 +44,26 @@ const currentKey = dateISO(today).slice(0,7)
 const methodLabel=m=>m==='credit'?'Crédito':'Débito/Pix'
 const bankName=id=>BANKS.find(b=>b.id===id)?.name || id
 
-function parseQuick(text){
+function parseQuick(text,people=[]){
   const raw=text.trim(), low=raw.toLowerCase()
   const installmentMatch=raw.match(/(?:em\s*)?(\d{1,2})\s*x\b/i)
   const match=raw.match(/(?:r\$\s*)?(\d+(?:[.,]\d{1,2})?)/i)
   if(!match)return {error:'Não encontrei um valor. Exemplo: Almoço 45 no crédito Nubank.'}
   const amount=Number(match[1].replace(',','.'))
+  const splitPercentMatch=raw.match(/\bdividir\s+(\d+(?:[.,]\d+)?)\s*%/i)
+  const splitWithMatch=raw.match(/\bdividid[oa]\s+com\s+(.+)$/i)
+  const splitRequested=Boolean(splitPercentMatch||splitWithMatch)
+  let sharedWith
+  if(splitWithMatch){
+    const requestedName=splitWithMatch[1].replace(/\bdividir\b.*$/i,'').replace(/\d+(?:[.,]\d+)?\s*%/i,'').trim().replace(/[.,;]+$/,'')
+    sharedWith=people.find(person=>person.name?.toLowerCase()===requestedName.toLowerCase()||person.email?.toLowerCase()===requestedName.toLowerCase()||person.email?.split('@')[0].toLowerCase()===requestedName.toLowerCase())
+    if(!sharedWith)return {error:`Não encontrei “${requestedName}” entre as pessoas vinculadas.`}
+  }else if(splitRequested){
+    if(people.length!==1)return {error:'Para dividir, vincule uma pessoa ou escreva “dividido com Nome”.'}
+    sharedWith=people[0]
+  }
+  const splitPercent=splitPercentMatch?Number(splitPercentMatch[1].replace(',','.')):50
+  if(splitPercent<0||splitPercent>100)return {error:'A porcentagem da divisão deve ficar entre 0% e 100%.'}
   const installmentCount=Math.min(24,Math.max(1,Number(installmentMatch?.[1]||1)))
   let bank='nubank'
   if(/santander|sant/i.test(low))bank='santander'
@@ -63,23 +77,30 @@ function parseQuick(text){
     /farm[aá]cia|consulta|m[eé]dic/i.test(low)?'Saúde':
     /roupa|t[eê]nis|cal[cç]ado|sapato|compra|loja/i.test(low)?'Compras':'Outros'
   let description=raw.replace(match[0],' ').replace(/(?:em\s*)?\d{1,2}\s*x\b/i,' ')
+    .replace(/\bdividid[oa]\s+com\s+.+$/i,' ').replace(/\bdividir\s+\d+(?:[.,]\d+)?\s*%?/i,' ')
     .replace(/\b(no|na|em|via|pelo|pela)\b/gi,' ')
     .replace(/nubank|santander|pic ?pay|\bbb\b|banco do brasil|cr[eé]dito|d[eé]bito|pix|cart[aã]o/gi,' ')
     .replace(/\s+/g,' ').trim().replace(/^[-–]+|[-–]+$/g,'')
   if(!description)description=category
-  return {amount,bank,method,category,description,installmentCount}
+  return {amount,bank,method,category,description,installmentCount,sharedWithUserId:sharedWith?.id,splitMode:splitPercentMatch?'percentage':splitRequested?'equal':'none',splitValue:splitPercent}
 }
 
 function createInstallments(transaction,count){
-  const totalCents=Math.round(Number(transaction.amount)*100)
+  const totalCents=Math.round(Number(transaction.transactionTotal??transaction.amount)*100)
+  const payerTotalCents=Math.round(Number(transaction.payerShare??totalCents/100)*100)
   const baseCents=Math.floor(totalCents/count)
   const extraCents=totalCents%count
+  const payerBaseCents=Math.floor(payerTotalCents/count)
+  const payerExtraCents=payerTotalCents%count
   const group=uid()
   return Array.from({length:count},(_,index)=>({
     ...transaction,
     id:uid(),
     date:addMonthsToDate(transaction.date,index),
-    amount:(baseCents+(index<extraCents?1:0))/100,
+    amount:(payerBaseCents+(index<payerExtraCents?1:0))/100,
+    transactionTotal:(baseCents+(index<extraCents?1:0))/100,
+    payerShare:(payerBaseCents+(index<payerExtraCents?1:0))/100,
+    sharedShare:((baseCents+(index<extraCents?1:0))-(payerBaseCents+(index<payerExtraCents?1:0)))/100,
     installmentGroup:group,
     installmentNumber:index+1,
     installmentCount:count,
@@ -95,6 +116,8 @@ export default function App(){
   const [dataReady,setDataReady]=useState(false)
   const [syncState,setSyncState]=useState('idle')
   const [syncError,setSyncError]=useState('')
+  const [connections,setConnections]=useState([])
+  const [connectionError,setConnectionError]=useState('')
   const dataRef=useRef(null)
   const syncQueue=useRef(Promise.resolve())
   const activeLoad=useRef(0)
@@ -106,6 +129,8 @@ export default function App(){
   })
   const [period,setPeriod]=useState(currentKey)
   const [quick,setQuick]=useState('')
+  const [quickSplitEnabled,setQuickSplitEnabled]=useState(false)
+  const [quickSplitPerson,setQuickSplitPerson]=useState('')
   const [toast,setToast]=useState('')
   const [modal,setModal]=useState(null)
   const [editing,setEditing]=useState(null)
@@ -118,10 +143,14 @@ export default function App(){
     let alive=true
     supabase.auth.getSession().then(({data:result})=>{if(alive){setSession(result.session);setAuthReady(true)}})
     const {data:listener}=supabase.auth.onAuthStateChange((_event,nextSession)=>{
-      if(alive){setSession(nextSession);if(!nextSession){dataRef.current=emptyFinanceData();setData(emptyFinanceData());setDataReady(false)}}
+      if(alive){setSession(nextSession);if(!nextSession){dataRef.current=emptyFinanceData();setData(emptyFinanceData());setDataReady(false);setConnections([])}}
     })
     return()=>{alive=false;listener.subscription.unsubscribe()}
   },[])
+  useEffect(()=>{
+    if(session?.user?.id)refreshConnections()
+    else setConnections([])
+  },[session?.user?.id])
   useEffect(()=>{
     if(!session?.user?.id){if(authReady){dataRef.current=emptyFinanceData();setData(emptyFinanceData());setDataReady(false)}return}
     const userId=session.user.id
@@ -134,7 +163,7 @@ export default function App(){
         if(!active||loadId!==activeLoad.current)return
         const cleanup=await removeLegacyDemoBatch(userId,remote)
         remote=cleanup.data
-        if(cleanup.removed)setToast(`${cleanup.removed} registros de demonstração antigos foram apagados.`)
+        if(cleanup.removed||cleanup.balancesReset)setToast(`${cleanup.removed?`${cleanup.removed} registros antigos apagados`:'Dados de demonstração removidos'}${cleanup.balancesReset?' e saldos de exemplo zerados':''}.`)
         if(!remote.hasCloudData){
           let raw=''
           try{raw=localStorage.getItem(STORAGE)||''}catch{}
@@ -160,7 +189,7 @@ export default function App(){
     supabase.realtime.setAuth(session.access_token).then(()=>{
       if(!active)return
       channel=supabase.channel(`user:${userId}:finance`,{config:{private:true}})
-        .on('broadcast',{event:'*'},()=>refreshCloudData(userId,active,loadId))
+        .on('broadcast',{event:'*'},()=>{refreshCloudData(userId,active,loadId);refreshConnections()})
         .subscribe()
     })
     return()=>{active=false;if(channel)supabase.removeChannel(channel)}
@@ -176,6 +205,12 @@ export default function App(){
     try{const fresh=await loadFinanceData(userId);if(active&&loadId===activeLoad.current){dataRef.current=fresh;setData(fresh);setSyncState('synced')}}
     catch(error){if(active){setSyncError(error.message||'Falha ao sincronizar.');setSyncState('error')}}
   }
+  async function refreshConnections(){
+    try{
+      const rows=await fetchUserLinks()
+      setConnections(rows);setConnectionError('')
+    }catch(error){setConnectionError(error.message||'Não foi possível carregar as pessoas vinculadas.')}
+  }
   function commitData(next){
     const previous=dataRef.current||emptyFinanceData()
     dataRef.current=next;setData(next);setSyncState('saving');setSyncError('')
@@ -186,6 +221,7 @@ export default function App(){
       .catch(error=>{setSyncError(error.message||'Falha ao salvar na nuvem.');setSyncState('error')})
   }
   const allMonths=useMemo(()=>[...new Set(data.transactions.map(t=>monthKey(t.date)))].sort(),[data.transactions])
+  const people=connections.filter(link=>link.status==='accepted').map(link=>({id:link.partner_id,name:link.partner_name||link.partner_email?.split('@')[0]||'Pessoa vinculada',email:link.partner_email}))
   const selectedMonth=period==='all'?currentKey:period
   const selected=period==='all'?data.transactions:data.transactions.filter(t=>monthKey(t.date)===period)
   const monthTransactions=selected
@@ -199,17 +235,22 @@ export default function App(){
   const daysInMonth=new Date(year,month,0).getDate()
   const daysLeft=selectedMonth===currentKey
     ?Math.max(1,daysInMonth-today.getDate()+1)
-    :selectedMonth>currentKey?daysInMonth:1
+    :daysInMonth
   const budgetTransactions=period==='all'?data.transactions.filter(t=>monthKey(t.date)===currentKey):monthTransactions
   const monthSpend=budgetTransactions.reduce((sum,t)=>sum+t.amount,0)
-  const remaining=selectedBudget-monthSpend
-  const daily=remaining/daysLeft
   const spentToday=selectedMonth===currentKey?budgetTransactions.filter(t=>t.date===dateISO(today)).reduce((s,t)=>s+t.amount,0):0
+  const startingBalance=data.banks.reduce((sum,bank)=>sum+Math.max(0,Number(bank.accountBalance)||0),0)
+  const spendBeforeToday=Math.max(0,monthSpend-spentToday)
+  const balanceRemaining=startingBalance-monthSpend
+  const budgetRemaining=selectedBudget-monthSpend
+  const dailyFunds=Math.max(0,Math.min(startingBalance-spendBeforeToday,selectedBudget-spendBeforeToday))
+  const daily=dailyFunds/daysLeft
   const canSpend=Math.max(0,daily-spentToday)
-  const dailyTone=remaining<0||spentToday>daily||daily<dailySafetyThreshold?'red':'green'
+  const dailyTone=balanceRemaining<0||budgetRemaining<0||spentToday>daily||daily<dailySafetyThreshold?'red':'green'
   const dailyStatusMessage=dailyTone==='green'
     ?'Sua meta diária ainda mantém uma margem confortável.'
-    :remaining<0?'O orçamento mensal foi ultrapassado. Revise os próximos gastos.'
+    :balanceRemaining<0?'Os gastos do mês ultrapassaram o saldo informado nas contas. Revise os próximos gastos.'
+      :budgetRemaining<0?'O orçamento mensal foi ultrapassado. Revise os próximos gastos.'
       :spentToday>daily?'Você já ultrapassou o valor previsto para hoje.'
         :`O limite diário está abaixo de ${money(dailySafetyThreshold)}.`
 
@@ -224,12 +265,24 @@ export default function App(){
     notify(installmentCount>1?`Compra parcelada em ${installmentCount}x registrada.`:'Gasto registrado com sucesso.')
   }
   function saveTransaction(tx){
-    if(editing){commitData({...data,monthBudgets:{...(data.monthBudgets||{}),[monthKey(tx.date)]:data.monthBudgets?.[monthKey(tx.date)]??data.settings.monthlyBudget},transactions:data.transactions.map(t=>t.id===editing.id?{...tx,id:editing.id}:t)});notify('Transação atualizada.')}
-    else addTransaction(tx)
+    const totalAmount=Number(tx.amount)
+    const sharedWithUserId=tx.splitEnabled?tx.sharedWithUserId:''
+    let payerShare=totalAmount
+    if(sharedWithUserId){
+      if(tx.splitMode==='percentage')payerShare=Math.round(totalAmount*Number(tx.splitValue||50))/100
+      else if(tx.splitMode==='amount')payerShare=Math.min(totalAmount,Math.max(0,Number(tx.splitValue)||0))
+      else payerShare=Math.round(totalAmount*50)/100
+    }
+    const sharedShare=Math.round((totalAmount-payerShare)*100)/100
+    const prepared={...tx,amount:payerShare,transactionTotal:totalAmount,payerShare,sharedShare,payerId:session.user.id,sharedWithUserId:sharedWithUserId||undefined,isPayer:true,isShared:Boolean(sharedWithUserId)}
+    if(editing){commitData({...data,monthBudgets:{...(data.monthBudgets||{}),[monthKey(prepared.date)]:data.monthBudgets?.[monthKey(prepared.date)]??data.settings.monthlyBudget},transactions:data.transactions.map(t=>t.id===editing.id?{...prepared,id:editing.id}:t)});notify('Transação atualizada.')}
+    else addTransaction(prepared)
     setModal(null);setEditing(null)
   }
-  function submitQuick(e){e.preventDefault();const parsed=parseQuick(quick);if(parsed.error){notify(parsed.error);return}
-    addTransaction({...parsed,date:dateISO(today)});setQuick('')
+  function submitQuick(e){e.preventDefault();const parsed=parseQuick(quick,people);if(parsed.error){notify(parsed.error);return}
+    if(quickSplitEnabled&&!people.some(person=>person.id===quickSplitPerson)){notify('Selecione uma pessoa vinculada para dividir a conta.');return}
+    const transaction=quickSplitEnabled?{...parsed,sharedWithUserId:quickSplitPerson,splitMode:'equal',splitValue:50}:parsed
+    saveTransaction({...transaction,date:dateISO(today),splitEnabled:Boolean(transaction.sharedWithUserId)});setQuick('');setQuickSplitEnabled(false);setQuickSplitPerson('')
   }
   function removeTransaction(id){
     const target=data.transactions.find(t=>t.id===id)
@@ -247,12 +300,22 @@ export default function App(){
   function changeMonth(delta){const base=period==='all'?new Date():new Date(selectedMonth+'-01T12:00:00');base.setMonth(base.getMonth()+delta);setPeriod(dateISO(base).slice(0,7))}
   function exportJSON(){const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});downloadBlob(blob,'meu-financeiro-backup.json')}
   function downloadBlob(blob,name){const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=name;a.click();URL.revokeObjectURL(url)}
-  function exportCSV(){const rows=[['Data','Descrição','Categoria','Banco','Método','Valor'],...selected.map(t=>[t.date,t.description,t.category,bankName(t.bank),methodLabel(t.method),t.amount])];const csv=rows.map(r=>r.map(v=>`"${String(v??'').replaceAll('"','""')}"`).join(';')).join('\\n');downloadBlob(new Blob(['\\ufeff'+csv],{type:'text/csv;charset=utf-8'}),`transacoes-${period}.csv`)}
+  function exportCSV(){const rows=[['Data','Descrição','Categoria','Banco','Método','Valor total','Sua parte','Parte do parceiro','Quitado'],...selected.map(t=>[t.date,t.description,t.category,bankName(t.bank),methodLabel(t.method),t.transactionTotal??t.amount,t.amount,t.isPayer?(t.sharedShare||0):(t.payerShare||0),t.isSettled?'Sim':'Não'])];const csv=rows.map(r=>r.map(v=>`"${String(v??'').replaceAll('"','""')}"`).join(';')).join('\\n');downloadBlob(new Blob(['\\ufeff'+csv],{type:'text/csv;charset=utf-8'}),`transacoes-${period}.csv`)}
   function restoreFile(e){const f=e.target.files?.[0];if(!f)return;const r=new FileReader();r.onload=()=>{try{const d=JSON.parse(r.result);if(d.version!==1||!Array.isArray(d.transactions)||!Array.isArray(d.banks))throw Error();commitData(d);setPeriod(currentKey);notify('Backup enviado para a nuvem.')}catch{notify('Arquivo inválido ou incompatível.')}};r.readAsText(f);e.target.value=''}
   function saveSettings(next){commitData(next);notify('Configurações salvas na nuvem.')}
+  async function settleTransactions(ids){
+    try{
+      for(const id of ids){
+        const {error}=await supabase.rpc('settle_shared_transaction',{p_transaction_id:String(id)})
+        if(error)throw error
+      }
+      const fresh=await loadFinanceData(session.user.id)
+      dataRef.current=fresh;setData(fresh);notify('Acerto marcado como quitado.')
+    }catch(error){notify(error.message||'Não foi possível registrar o acerto.')}
+  }
   const filtered=monthTransactions.filter(t=>(filters.bank==='all'||t.bank===filters.bank)&&(filters.method==='all'||t.method===filters.method)&&(filters.category==='all'||t.category===filters.category)&&(!filters.search||t.description.toLowerCase().includes(filters.search.toLowerCase())))
   const bankSummary=BANKS.map(b=>({...b,color:bankAccent(b.id,theme),debit:monthTransactions.filter(t=>t.bank===b.id&&t.method==='debit').reduce((s,t)=>s+t.amount,0),credit:monthTransactions.filter(t=>t.bank===b.id&&t.method==='credit').reduce((s,t)=>s+t.amount,0)}))
-  const dailyChart=Array.from({length:new Date(year,month,0).getDate()},(_,i)=>{const day=i+1;const key=`${selectedMonth}-${String(day).padStart(2,'0')}`;return {day:String(day),gasto:monthTransactions.filter(t=>t.date===key).reduce((s,t)=>s+t.amount,0),meta:selectedBudget/new Date(year,month,0).getDate()}})
+  const dailyChart=Array.from({length:new Date(year,month,0).getDate()},(_,i)=>{const day=i+1;const key=`${selectedMonth}-${String(day).padStart(2,'0')}`;return {day:String(day),gasto:monthTransactions.filter(t=>t.date===key).reduce((s,t)=>s+t.amount,0),meta:daily}})
   const monthlyChart=allMonths.map(k=>{const row={mes:new Date(Number(k.slice(0,4)),Number(k.slice(5,7))-1,1).toLocaleDateString('pt-BR',{month:'short',year:'2-digit'})};BANKS.forEach(b=>row[b.id]=data.transactions.filter(t=>monthKey(t.date)===k&&t.bank===b.id).reduce((s,t)=>s+t.amount,0));return row})
   const categoryChart=CATEGORIES.map(c=>({name:c,value:monthTransactions.filter(t=>t.category===c).reduce((s,t)=>s+t.amount,0)})).filter(x=>x.value>0)
   const chartColors=theme==='dark'
@@ -263,6 +326,20 @@ export default function App(){
   const monthOptions=[...new Set([...allMonths,...Array.from({length:37},(_,i)=>shiftMonth(currentKey,i-12))])].sort()
   const futureCommitments=data.transactions.filter(t=>t.installmentGroup&&monthKey(t.date)>selectedMonth)
   const futureCommitted=futureCommitments.reduce((sum,t)=>sum+t.amount,0)
+  const settlementMap=new Map()
+  const settlementTransactions=period==='all'?data.transactions.filter(transaction=>monthKey(transaction.date)===currentKey):monthTransactions
+  for(const transaction of settlementTransactions){
+    if(!transaction.sharedWithUserId||transaction.isSettled)continue
+    const paidByMe=transaction.payerId===session?.user?.id
+    const partnerId=paidByMe?transaction.sharedWithUserId:transaction.payerId
+    if(!partnerId)continue
+    const row=settlementMap.get(partnerId)||{partnerId,net:0,transactionIds:[]}
+    row.net+=paidByMe?Number(transaction.sharedShare||0):-Number(transaction.sharedShare||0)
+    row.transactionIds.push(transaction.id)
+    settlementMap.set(partnerId,row)
+  }
+  const settlementBalances=[...settlementMap.values()]
+  const personName=id=>people.find(person=>person.id===id)?.name||'Pessoa vinculada'
 
   if(!authReady)return <div className="min-h-screen grid place-items-center"><LoaderCircle className="animate-spin muted"/></div>
   if(!supabaseConfigured)return <AuthScreen configured={false} theme={theme} onToggleTheme={toggleTheme}/>
@@ -273,10 +350,10 @@ export default function App(){
     <header className="bg-white border-b border-slate-100 sticky top-0 z-30">
       <div className="max-w-[1440px] mx-auto px-5 lg:px-8 min-h-[72px] flex flex-wrap items-center justify-between gap-4 py-3">
         <div><div className="text-[10px] font-bold tracking-[.2em] text-slate-500 uppercase">Finanças pessoais</div><div className="font-bold tracking-tight text-[17px]" style={{fontFamily:'Manrope'}}>meu financeiro</div></div>
-        <nav className="order-3 w-full md:order-none md:w-auto flex items-center justify-center gap-1 bg-transparent md:bg-slate-50 p-1 rounded-xl overflow-x-auto">
-          <button onClick={()=>setTab('dashboard')} className={`px-4 py-2 rounded-lg text-sm font-semibold ${tab==='dashboard'?'bg-white shadow-sm text-violet-700':'text-slate-500'}`}><span className="flex gap-2 items-center"><LayoutDashboard size={15}/>Resumo</span></button>
-          <button onClick={()=>setTab('transactions')} className={`px-4 py-2 rounded-lg text-sm font-semibold ${tab==='transactions'?'bg-white shadow-sm text-violet-700':'text-slate-500'}`}>Transações</button>
-          <button onClick={()=>setTab('settings')} className={`px-4 py-2 rounded-lg text-sm font-semibold ${tab==='settings'?'bg-white shadow-sm text-violet-700':'text-slate-500'}`}><span className="flex gap-2 items-center"><Settings2 size={15}/>Configurações</span></button>
+        <nav className="nav-tabs order-3 w-full md:order-none md:w-auto flex items-center justify-center gap-1 p-1 rounded-xl overflow-x-auto" aria-label="Navegação principal">
+          <button onClick={()=>setTab('dashboard')} aria-current={tab==='dashboard'?'page':undefined} className={`nav-tab px-4 py-2 rounded-lg text-sm font-semibold ${tab==='dashboard'?'is-active':''}`}><span className="flex gap-2 items-center"><LayoutDashboard size={15}/>Resumo</span></button>
+          <button onClick={()=>setTab('transactions')} aria-current={tab==='transactions'?'page':undefined} className={`nav-tab px-4 py-2 rounded-lg text-sm font-semibold ${tab==='transactions'?'is-active':''}`}>Transações</button>
+          <button onClick={()=>setTab('settings')} aria-current={tab==='settings'?'page':undefined} className={`nav-tab px-4 py-2 rounded-lg text-sm font-semibold ${tab==='settings'?'is-active':''}`}><span className="flex gap-2 items-center"><Settings2 size={15}/>Configurações</span></button>
         </nav>
         <div className="flex gap-2 items-center"><span className="hidden lg:flex items-center gap-1.5 text-[11px] muted max-w-[180px] truncate" title={session.user.email}>{syncState==='saving'||syncState==='loading'?<LoaderCircle size={13} className="animate-spin"/>:<Cloud size={13}/>} {session.user.email}</span><button onClick={()=>supabase.auth.signOut()} className="btn btn-light !p-2" title="Sair" aria-label="Sair"><LogOut size={16}/></button><button type="button" className="btn btn-light !p-2 theme-toggle" onClick={toggleTheme} aria-pressed={theme==='dark'} aria-label={theme==='dark'?'Ativar modo claro':'Ativar modo escuro'} title={theme==='dark'?'Ativar modo claro':'Ativar modo escuro'}>{theme==='dark'?<Sun size={17} strokeWidth={1.75}/>:<Moon size={17} strokeWidth={1.75}/>}</button><button className="btn btn-light !p-2" title="Exportar backup" onClick={exportJSON}><Download size={17}/></button><button className="btn btn-light !p-2" title="Restaurar backup" onClick={()=>fileRef.current?.click()}><Upload size={17}/></button><input ref={fileRef} type="file" accept="application/json" className="hidden" onChange={restoreFile}/></div>
       </div>
@@ -287,18 +364,35 @@ export default function App(){
         <div className="flex flex-wrap items-center gap-2"><div className="flex items-center bg-white border border-slate-200 rounded-xl p-1"><button onClick={()=>changeMonth(-1)} className="p-2 text-slate-500 hover:text-violet-700"><ChevronLeft size={17}/></button><button onClick={()=>setPeriod('all')} className={`px-3 py-1.5 text-sm font-semibold rounded-lg ${period==='all'?'bg-violet-50 text-violet-700':'text-slate-600'}`}>Visão Geral</button><span className="text-slate-200">|</span><button onClick={()=>setPeriod(currentKey)} className={`px-3 py-1.5 text-sm font-semibold rounded-lg capitalize ${period===currentKey?'bg-violet-50 text-violet-700':'text-slate-600'}`}>{fmtMonth(currentKey)}</button><button onClick={()=>changeMonth(1)} className="p-2 text-slate-500 hover:text-violet-700"><ChevronRight size={17}/></button></div><select className="field !w-auto !py-2.5 text-sm capitalize" value={period} onChange={e=>setPeriod(e.target.value)}><option value="all">Todos os meses</option>{monthOptions.map(m=><option key={m} value={m}>{fmtMonth(m)}</option>)}</select><button onClick={()=>{setEditing(null);setModal('transaction')}} className="btn btn-primary"><Plus size={16}/> Novo gasto</button></div>
       </div>
 
-      <form onSubmit={submitQuick} className="card p-3 md:p-4 mb-5 flex flex-col md:flex-row gap-3 items-stretch md:items-center">
-        
-        <div className="flex-1"><div className="text-sm font-bold">Adicionar por texto <span className="text-xs font-normal muted ml-1">Informe valor, descrição e banco.</span></div><input value={quick} onChange={e=>setQuick(e.target.value)} className="w-full outline-none text-sm mt-1 placeholder:text-slate-400" placeholder="Ex.: Tênis 450 em 3x no Nubank · Mercado 120 no Pix PicPay"/></div>
-        <button className="btn btn-primary" type="submit">Registrar gasto <ArrowUpRight size={15}/></button>
+      <form onSubmit={submitQuick} className="card p-4 md:p-5 mb-5 flex flex-col gap-3">
+        <div className="flex flex-col md:flex-row gap-3 items-stretch md:items-end">
+          <div className="flex-1"><div className="text-sm font-bold">Adicionar por texto <span className="text-xs font-normal muted ml-1">Informe valor, descrição e banco.</span></div><input value={quick} onChange={e=>setQuick(e.target.value)} className="w-full outline-none text-sm mt-1 placeholder:text-slate-400" placeholder="Ex.: Jantar 100 no Nubank · Tênis 450 em 3x no Santander"/></div>
+          <button className="btn btn-primary shrink-0" type="submit">Registrar gasto <ArrowUpRight size={15}/></button>
+        </div>
+        <div className="flex flex-col sm:flex-row sm:items-center gap-3 border-t border-slate-100 pt-3">
+          <label className={`inline-flex items-center gap-2 text-sm font-medium ${people.length?'cursor-pointer':'cursor-not-allowed opacity-60'}`}>
+            <input type="checkbox" checked={quickSplitEnabled} disabled={!people.length} onChange={e=>{const enabled=e.target.checked;setQuickSplitEnabled(enabled);if(enabled&&!quickSplitPerson&&people[0])setQuickSplitPerson(people[0].id)}} className="accent-slate-900"/>
+            Dividir conta
+          </label>
+          {quickSplitEnabled&&people.length>0&&<div className="flex flex-wrap items-center gap-2">
+            <label htmlFor="quick-split-person" className="text-xs muted">Com</label>
+            <select id="quick-split-person" className="field !w-auto !py-2 text-sm" value={quickSplitPerson} onChange={e=>setQuickSplitPerson(e.target.value)}>
+              <option value="" disabled>Selecione uma pessoa</option>{people.map(person=><option key={person.id} value={person.id}>{person.name}</option>)}
+            </select>
+            <span className="text-xs muted">Meio a meio · 50% para cada pessoa</span>
+          </div>}
+          {!people.length&&<span className="text-xs muted">Vincule uma pessoa em Configurações para dividir gastos.</span>}
+        </div>
       </form>
 
       <div className={`budget-card status-${dailyTone} rounded-xl p-5 mb-6 flex flex-col md:flex-row md:items-center justify-between gap-4`}>
         <div className="flex-1"><span className={`budget-badge status-${dailyTone}`}>{dailyTone==='green'?'Orçamento saudável — margem livre':'Atenção — reduza o ritmo de gastos'}</span><p className="text-xs text-slate-600 mt-2">{dailyStatusMessage} {daysLeft===1?'Resta 1 dia':'Restam '+daysLeft+' dias'} neste mês.</p></div>
-        <div className="md:text-right"><div className="text-[11px] uppercase tracking-wider font-bold text-slate-500">{selectedMonth===currentKey?'Pode gastar hoje':'Meta diária deste mês'}</div><div className={`budget-value status-${dailyTone} text-2xl font-extrabold tracking-tight`} style={{fontFamily:'Manrope'}}>{money(canSpend)}</div><div className="text-[11px] text-slate-500">Meta diária recalculada: {money(Math.max(0,daily))}</div></div>
+        <div className="md:text-right"><div className="text-[11px] uppercase tracking-wider font-bold text-slate-500">{selectedMonth===currentKey?'Pode gastar hoje':'Meta diária deste mês'}</div><div className={`budget-value status-${dailyTone} text-2xl font-extrabold tracking-tight`} style={{fontFamily:'Manrope'}}>{money(canSpend)}</div><div className="text-[11px] text-slate-500">Meta diária: {money(Math.max(0,daily))}</div><div className="text-[11px] text-slate-500">Saldo inicial total: {money(startingBalance)} · após gastos: {money(Math.max(0,startingBalance-monthSpend))}</div></div>
       </div>
 
-      {tab==='settings'?<Settings data={data} onSave={saveSettings} theme={theme}/>:
+      {tab==='dashboard'&&<section className="card p-5 mb-5"><div className="flex items-start justify-between gap-3 mb-4"><div><h2 className="font-bold" style={{fontFamily:'Manrope'}}>Acerto de Contas</h2><p className="text-xs muted mt-1">Pendências de despesas compartilhadas em {fmtMonth(selectedMonth)}.</p></div><span className="text-xs muted">{settlementBalances.length} pessoa(s)</span></div>{settlementBalances.length?<div className="divide-y divide-slate-100">{settlementBalances.map(balance=><div key={balance.partnerId} className="py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3"><div><div className="font-semibold text-sm">{balance.net>0?`${personName(balance.partnerId)} te deve ${money(balance.net)}`:balance.net<0?`Você deve ${money(Math.abs(balance.net))} para ${personName(balance.partnerId)}`:`Saldo zerado com ${personName(balance.partnerId)}`}</div><div className="text-xs muted mt-1">{balance.transactionIds.length} gasto(s) ainda não quitado(s)</div></div><button className="btn btn-light" onClick={()=>settleTransactions(balance.transactionIds)}>Marcar como acertado / quitado</button></div>)}</div>:<div className="text-sm muted py-2">Nenhum acerto pendente neste mês.</div>}</section>}
+
+      {tab==='settings'?<Settings data={data} onSave={saveSettings} theme={theme} connections={connections} currentUserId={session.user.id} connectionError={connectionError} onConnectionsChanged={refreshConnections}/>:
       <>{tab==='dashboard'&&<>
         <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-4 mb-5">
           <Kpi title="Gasto no período" value={money(total)} note={period==='all'?'Somatório de todos os meses':`Orçamento: ${money(selectedBudget)}`}/>
@@ -317,12 +411,12 @@ export default function App(){
       <section className="card p-5">
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 mb-4"><div><h2 className="font-bold" style={{fontFamily:'Manrope'}}>{tab==='transactions'?'Todas as transações':'Últimas transações'}</h2><p className="text-xs muted mt-1">{filtered.length} registro(s) · {periodLabel}</p></div><div className="flex gap-2 flex-wrap"><button className="btn btn-light" onClick={exportCSV}><FileDown size={15}/>Exportar CSV</button>{tab==='dashboard'&&<button className="btn btn-light" onClick={()=>setTab('transactions')}>Ver todas</button>}</div></div>
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2 mb-4"><div className="relative"><Search size={15} className="absolute left-3 top-3 text-slate-400"/><input className="field !pl-9" placeholder="Buscar descrição..." value={filters.search} onChange={e=>setFilters({...filters,search:e.target.value})}/></div><select className="field" value={filters.bank} onChange={e=>setFilters({...filters,bank:e.target.value})}><option value="all">Todos os bancos</option>{BANKS.map(b=><option value={b.id} key={b.id}>{b.name}</option>)}</select><select className="field" value={filters.method} onChange={e=>setFilters({...filters,method:e.target.value})}><option value="all">Todos os métodos</option><option value="credit">Crédito</option><option value="debit">Débito / Pix</option></select><select className="field" value={filters.category} onChange={e=>setFilters({...filters,category:e.target.value})}><option value="all">Todas as categorias</option>{CATEGORIES.map(c=><option key={c}>{c}</option>)}</select></div>
-        <div className="overflow-x-auto"><table className="w-full text-left min-w-[700px]"><thead><tr className="text-[10px] uppercase tracking-wider muted border-b border-slate-100"><th className="py-3 font-semibold">Descrição</th><th className="py-3 font-semibold">Data</th><th className="py-3 font-semibold">Instituição</th><th className="py-3 font-semibold">Método</th><th className="py-3 font-semibold text-right">Valor</th><th className="py-3"></th></tr></thead><tbody>{filtered.slice(0,tab==='dashboard'?8:filtered.length).map(t=><tr key={t.id} className="border-b border-slate-50 last:border-0 hover:bg-slate-50/70"><td className="py-3"><div className="font-semibold text-sm">{t.description}</div><div className="text-[11px] muted">{t.category}{t.installmentCount>1&&<span className="ml-2 inline-flex rounded-md bg-violet-50 px-2 py-0.5 font-semibold text-violet-700">Parcela {t.installmentNumber}/{t.installmentCount}</span>}</div></td><td className="py-3 text-xs text-slate-500">{new Date(t.date+'T12:00:00').toLocaleDateString('pt-BR')}</td><td className="py-3"><span className="inline-flex items-center gap-2 text-xs font-semibold"><span className="w-2 h-2 rounded-full" style={{background:bankAccent(t.bank,theme)}}/>{data.banks.find(b=>b.id===t.bank)?.name||bankName(t.bank)}</span></td><td className="py-3"><span className={`text-[10px] font-bold px-2 py-1 rounded-md ${t.method==='credit'?'bg-blue-50 text-blue-700':'bg-emerald-50 text-emerald-700'}`}>{methodLabel(t.method)}</span></td><td className="py-3 text-right text-sm font-bold">{money(t.amount)}</td><td className="py-3 text-right"><button title="Editar" onClick={()=>{setEditing(t);setModal('transaction')}} className="p-2 text-slate-400 hover:text-violet-700"><Pencil size={14}/></button><button title="Excluir" onClick={()=>removeTransaction(t.id)} className="p-2 text-slate-400 hover:text-rose-600"><Trash2 size={14}/></button></td></tr>)}</tbody></table>{!filtered.length&&<div className="py-12 text-center text-sm muted">Nenhuma transação encontrada com esses filtros.</div>}</div>
+        <div className="overflow-x-auto"><table className="w-full text-left min-w-[700px]"><thead><tr className="text-[10px] uppercase tracking-wider muted border-b border-slate-100"><th className="py-3 font-semibold">Descrição</th><th className="py-3 font-semibold">Data</th><th className="py-3 font-semibold">Instituição</th><th className="py-3 font-semibold">Método</th><th className="py-3 font-semibold text-right">Sua parte</th><th className="py-3"></th></tr></thead><tbody>{filtered.slice(0,tab==='dashboard'?8:filtered.length).map(t=><tr key={t.id} className="border-b border-slate-50 last:border-0 hover:bg-slate-50/70"><td className="py-3"><div className="font-semibold text-sm">{t.description}</div><div className="text-[11px] muted">{t.category}{t.installmentCount>1&&<span className="ml-2 inline-flex rounded-md bg-violet-50 px-2 py-0.5 font-semibold text-violet-700">Parcela {t.installmentNumber}/{t.installmentCount}</span>}{t.isShared&&<span className="ml-2 inline-flex rounded-md bg-emerald-50 px-2 py-0.5 font-semibold text-emerald-800">Dividido {t.isPayer?'com':'por'} {personName(t.isPayer?t.sharedWithUserId:t.payerId)}</span>}{t.isShared&&t.isSettled&&<span className="ml-2 inline-flex rounded-md bg-slate-100 px-2 py-0.5 font-semibold">Quitado</span>}</div>{t.isShared&&<div className="text-[11px] muted mt-1">Total {money(t.transactionTotal)} · sua parte {money(t.amount)} · {t.isPayer?`a receber ${money(t.sharedShare)}`:`a pagar ${money(t.sharedShare)}`}</div>}</td><td className="py-3 text-xs text-slate-500">{new Date(t.date+'T12:00:00').toLocaleDateString('pt-BR')}</td><td className="py-3"><span className="inline-flex items-center gap-2 text-xs font-semibold"><span className="w-2 h-2 rounded-full" style={{background:bankAccent(t.bank,theme)}}/>{data.banks.find(b=>b.id===t.bank)?.name||bankName(t.bank)}</span></td><td className="py-3"><span className={`text-[10px] font-bold px-2 py-1 rounded-md ${t.method==='credit'?'bg-blue-50 text-blue-700':'bg-emerald-50 text-emerald-700'}`}>{methodLabel(t.method)}</span></td><td className="py-3 text-right text-sm font-bold">{money(t.amount)}</td><td className="py-3 text-right">{t.isPayer&&<><button title="Editar" onClick={()=>{setEditing(t);setModal('transaction')}} className="p-2 text-slate-400 hover:text-violet-700"><Pencil size={14}/></button><button title="Excluir" onClick={()=>removeTransaction(t.id)} className="p-2 text-slate-400 hover:text-rose-600"><Trash2 size={14}/></button></>}</td></tr>)}</tbody></table>{!filtered.length&&<div className="py-12 text-center text-sm muted">Nenhuma transação encontrada com esses filtros.</div>}</div>
       </section>
       </>}
       <footer className="flex flex-col sm:flex-row justify-between gap-2 py-6 text-[11px] muted"><span>{syncError?`Erro de sincronização: ${syncError}`:syncState==='synced'?'Dados sincronizados com segurança na nuvem.':'Salvando alterações na nuvem…'}</span><div className="flex gap-3"><button onClick={exportJSON} className="hover:text-violet-700">Backup (JSON)</button></div></footer>
     </main>
-    {modal==='transaction'&&<TransactionModal banks={data.banks} initial={editing} onClose={()=>{setModal(null);setEditing(null)}} onSave={saveTransaction}/>}
+    {modal==='transaction'&&<TransactionModal banks={data.banks} people={people} initial={editing} onClose={()=>{setModal(null);setEditing(null)}} onSave={saveTransaction}/>}
     {modal==='delete-installment'&&deleteTarget&&<div className="fixed inset-0 z-50 bg-slate-900/30 grid place-items-center p-4"><div className="card w-full max-w-md p-6"><h2 className="text-lg font-extrabold" style={{fontFamily:'Manrope'}}>Excluir compra parcelada</h2><p className="text-sm muted mt-2 mb-5">Esta é a parcela {deleteTarget.installmentNumber}/{deleteTarget.installmentCount} de “{deleteTarget.description}”. O que deseja apagar?</p><div className="flex flex-col gap-2"><button className="btn btn-light" onClick={()=>removeInstallments('current')}>Apenas esta parcela</button><button className="btn btn-primary" onClick={()=>removeInstallments('future')}>Esta e todas as parcelas futuras</button><button className="btn btn-light mt-1" onClick={()=>{setDeleteTarget(null);setModal(null)}}>Cancelar</button></div></div></div>}
     {toast&&<div className="fixed bottom-5 right-5 z-50 bg-white border border-slate-200 text-slate-800 rounded-xl shadow-xl px-4 py-3 text-sm flex items-center gap-2"><Check size={16}/>{toast}</div>}
   </div>
@@ -373,19 +467,121 @@ function Kpi({title,value,note}){
   </div>
 }
 
-function TransactionModal({banks,initial,onClose,onSave}){
-  const [form,setForm]=useState(initial?{...initial,installmentCount:initial.installmentCount||1}:{date:dateISO(new Date()),description:'',amount:'',category:'Alimentação',bank:'nubank',method:'debit',installmentCount:1})
-  const update=(k,v)=>setForm(f=>({...f,[k]:v}))
-  function submit(e){e.preventDefault();if(!form.description.trim()||Number(form.amount)<=0)return;onSave({...form,amount:Number(form.amount),installmentCount:form.method==='credit'?Number(form.installmentCount)||1:1})}
-  return <div className="fixed inset-0 z-50 bg-slate-900/30 grid place-items-center p-4" onMouseDown={e=>{if(e.target===e.currentTarget)onClose()}}><form onSubmit={submit} className="bg-white rounded-2xl shadow-2xl w-full max-w-lg p-6"><div className="flex justify-between items-center mb-5"><div><h2 className="text-lg font-extrabold" style={{fontFamily:'Manrope'}}>{initial?'Editar gasto':'Novo gasto'}</h2><p className="text-xs muted mt-1">Preencha os dados da movimentação.</p></div><button type="button" onClick={onClose} className="p-2 text-slate-400"><X size={19}/></button></div><div className="grid grid-cols-2 gap-3"><label className="col-span-2 text-xs font-semibold text-slate-600">Descrição<input required className="field mt-1.5" placeholder="Ex.: Almoço" value={form.description} onChange={e=>update('description',e.target.value)}/></label><label className="text-xs font-semibold text-slate-600">Valor total da compra (R$)<input required min="0.01" step="0.01" type="number" className="field mt-1.5" placeholder="0,00" value={form.amount} onChange={e=>update('amount',e.target.value)}/></label><label className="text-xs font-semibold text-slate-600">Data<input required type="date" className="field mt-1.5" value={form.date} onChange={e=>update('date',e.target.value)}/></label><label className="text-xs font-semibold text-slate-600">Categoria<select className="field mt-1.5" value={form.category} onChange={e=>update('category',e.target.value)}>{CATEGORIES.map(c=><option key={c}>{c}</option>)}</select></label><label className="text-xs font-semibold text-slate-600">Instituição<select className="field mt-1.5" value={form.bank} onChange={e=>update('bank',e.target.value)}>{BANKS.map(b=><option key={b.id} value={b.id}>{b.name}</option>)}</select></label><label className="col-span-2 text-xs font-semibold text-slate-600">Forma de pagamento<div className="grid grid-cols-2 gap-2 mt-1.5"><button type="button" onClick={()=>update('method','debit')} className={`p-3 rounded-xl border text-sm font-semibold ${form.method==='debit'?'border-violet-400 bg-violet-50 text-violet-700':'border-slate-200 text-slate-500'}`}>Débito / Pix</button><button type="button" onClick={()=>update('method','credit')} className={`p-3 rounded-xl border text-sm font-semibold ${form.method==='credit'?'border-violet-400 bg-violet-50 text-violet-700':'border-slate-200 text-slate-500'}`}>Crédito</button></div></label>{form.method==='credit'&&<label className="col-span-2 text-xs font-semibold text-slate-600">Número de parcelas<select className="field mt-1.5" value={form.installmentCount} disabled={Boolean(initial?.installmentGroup)} onChange={e=>update('installmentCount',Number(e.target.value))}>{Array.from({length:24},(_,i)=><option key={i+1} value={i+1}>{i+1}x</option>)}</select>{initial?.installmentGroup&&<span className="block mt-1 font-normal muted">Esta compra já possui parcelas vinculadas.</span>}</label>}</div><div className="flex justify-end gap-2 mt-6"><button type="button" onClick={onClose} className="btn btn-light">Cancelar</button><button className="btn btn-primary" type="submit"><Check size={15}/>Salvar gasto</button></div></form></div>
+function TransactionModal({banks,people,initial,onClose,onSave}){
+  const [form,setForm]=useState(()=>initial?{
+    ...initial,
+    amount:String(initial.transactionTotal??initial.amount),
+    installmentCount:initial.installmentCount||1,
+    splitEnabled:Boolean(initial.sharedWithUserId),
+    sharedWithUserId:initial.sharedWithUserId||'',
+    splitMode:initial.sharedWithUserId?'amount':'equal',
+    splitValue:initial.payerShare??initial.amount
+  }:{date:dateISO(new Date()),description:'',amount:'',category:'Alimentação',bank:'nubank',method:'debit',installmentCount:1,splitEnabled:false,sharedWithUserId:people[0]?.id||'',splitMode:'equal',splitValue:50})
+  const update=(key,value)=>setForm(current=>({...current,[key]:value}))
+  const totalAmount=Number(form.amount)||0
+  const ownShare=form.splitMode==='percentage'?totalAmount*(Number(form.splitValue||0)/100):form.splitMode==='amount'?Number(form.splitValue||0):totalAmount/2
+  function submit(event){
+    event.preventDefault()
+    if(!form.description.trim()||totalAmount<=0)return
+    if(form.splitEnabled&&!form.sharedWithUserId)return
+    if(form.splitEnabled&&(ownShare<0||ownShare>totalAmount))return
+    onSave({...form,amount:totalAmount,installmentCount:form.method==='credit'?Number(form.installmentCount)||1:1})
+  }
+  return <div className="fixed inset-0 z-50 bg-slate-900/30 grid place-items-center p-4" onMouseDown={event=>{if(event.target===event.currentTarget)onClose()}}>
+    <form onSubmit={submit} className="card w-full max-w-lg p-6 max-h-[92vh] overflow-y-auto">
+      <div className="flex justify-between items-center mb-5"><div><h2 className="text-lg font-extrabold" style={{fontFamily:'Manrope'}}>{initial?'Editar gasto':'Novo gasto'}</h2><p className="text-xs muted mt-1">Preencha os dados da movimentação.</p></div><button type="button" onClick={onClose} className="p-2 text-slate-400"><X size={19}/></button></div>
+      <div className="grid grid-cols-2 gap-3">
+        <label className="col-span-2 text-xs font-semibold text-slate-600">Descrição<input required className="field mt-1.5" placeholder="Ex.: Almoço" value={form.description} onChange={event=>update('description',event.target.value)}/></label>
+        <label className="text-xs font-semibold text-slate-600">Valor total da compra (R$)<input required min="0.01" step="0.01" type="number" className="field mt-1.5" placeholder="0,00" value={form.amount} onChange={event=>update('amount',event.target.value)}/></label>
+        <label className="text-xs font-semibold text-slate-600">Data<input required type="date" className="field mt-1.5" value={form.date} onChange={event=>update('date',event.target.value)}/></label>
+        <label className="text-xs font-semibold text-slate-600">Categoria<select className="field mt-1.5" value={form.category} onChange={event=>update('category',event.target.value)}>{CATEGORIES.map(category=><option key={category}>{category}</option>)}</select></label>
+        <label className="text-xs font-semibold text-slate-600">Instituição<select className="field mt-1.5" value={form.bank} onChange={event=>update('bank',event.target.value)}>{banks.map(bank=><option key={bank.id} value={bank.id}>{bank.name}</option>)}</select></label>
+        <label className="col-span-2 text-xs font-semibold text-slate-600">Forma de pagamento<div className="grid grid-cols-2 gap-2 mt-1.5"><button type="button" onClick={()=>update('method','debit')} className={`p-3 rounded-xl border text-sm font-semibold ${form.method==='debit'?'border-violet-400 bg-violet-50 text-violet-700':'border-slate-200 text-slate-500'}`}>Débito / Pix</button><button type="button" onClick={()=>update('method','credit')} className={`p-3 rounded-xl border text-sm font-semibold ${form.method==='credit'?'border-violet-400 bg-violet-50 text-violet-700':'border-slate-200 text-slate-500'}`}>Crédito</button></div></label>
+        {form.method==='credit'&&<label className="col-span-2 text-xs font-semibold text-slate-600">Número de parcelas<select className="field mt-1.5" value={form.installmentCount} disabled={Boolean(initial?.installmentGroup)} onChange={event=>update('installmentCount',Number(event.target.value))}>{Array.from({length:24},(_,index)=><option key={index+1} value={index+1}>{index+1}x</option>)}</select>{initial?.installmentGroup&&<span className="block mt-1 font-normal muted">Esta compra já possui parcelas vinculadas.</span>}</label>}
+        <label className="col-span-2 flex items-center gap-2 rounded-lg border border-slate-200 p-3 text-sm font-semibold"><input type="checkbox" checked={form.splitEnabled} disabled={!people.length} onChange={event=>{update('splitEnabled',event.target.checked);if(event.target.checked&&!form.sharedWithUserId&&people[0])update('sharedWithUserId',people[0].id)}}/>Dividir este gasto{!people.length&&<span className="ml-auto text-xs font-normal muted">Vincule alguém nas configurações</span>}</label>
+        {form.splitEnabled&&<>
+          <label className="col-span-2 text-xs font-semibold text-slate-600">Dividir com<select className="field mt-1.5" required value={form.sharedWithUserId} onChange={event=>update('sharedWithUserId',event.target.value)}><option value="">Selecione uma pessoa</option>{people.map(person=><option key={person.id} value={person.id}>{person.name} · {person.email}</option>)}</select></label>
+          <label className="col-span-2 text-xs font-semibold text-slate-600">Proporção<select className="field mt-1.5" value={form.splitMode} onChange={event=>setForm(current=>({ ...current, splitMode:event.target.value, splitValue:event.target.value==='percentage'?50:event.target.value==='amount'?(Number(current.amount||0)/2).toFixed(2):50 }))}><option value="equal">Meio a meio (50% / 50%)</option><option value="percentage">Porcentagem personalizada</option><option value="amount">Valor que eu pago</option></select></label>
+          {form.splitMode==='percentage'&&<label className="col-span-2 text-xs font-semibold text-slate-600">Sua parte (%)<input required type="number" min="0" max="100" step="0.01" className="field mt-1.5" value={form.splitValue} onChange={event=>update('splitValue',event.target.value)}/></label>}
+          {form.splitMode==='amount'&&<label className="col-span-2 text-xs font-semibold text-slate-600">Sua parte do total (R$)<input required type="number" min="0" max={totalAmount} step="0.01" className="field mt-1.5" value={form.splitValue} onChange={event=>update('splitValue',event.target.value)}/></label>}
+          <div className="col-span-2 rounded-lg bg-slate-50 p-3 text-xs muted">Sua parte: <strong>{money(Math.max(0,ownShare))}</strong> · Parte de {people.find(person=>person.id===form.sharedWithUserId)?.name||'outra pessoa'}: <strong>{money(Math.max(0,totalAmount-ownShare))}</strong></div>
+        </>}
+      </div>
+      <div className="flex justify-end gap-2 mt-6"><button type="button" onClick={onClose} className="btn btn-light">Cancelar</button><button className="btn btn-primary" type="submit"><Check size={15}/>Salvar gasto</button></div>
+    </form>
+  </div>
 }
 
-function Settings({data,onSave,theme}){
+function Settings({data,onSave,theme,connections,currentUserId,connectionError,onConnectionsChanged}){
   const [budget,setBudget]=useState(data.settings.monthlyBudget)
   const [dailySafetyThreshold,setDailySafetyThreshold]=useState(data.settings.dailySafetyThreshold??40)
   const [banks,setBanks]=useState(data.banks)
   const [newBank,setNewBank]=useState('')
+  const [inviteEmail,setInviteEmail]=useState('')
+  const [inviteCode,setInviteCode]=useState('')
+  const [connectionMessage,setConnectionMessage]=useState('')
+  const [connectionBusy,setConnectionBusy]=useState(false)
   function save(){onSave({...data,settings:{...data.settings,monthlyBudget:Number(budget),dailySafetyThreshold:Math.max(0,Number(dailySafetyThreshold)||0)},monthBudgets:{...(data.monthBudgets||{}),[dateISO(new Date()).slice(0,7)]:Number(budget)},banks})}
   function addBank(){if(!newBank.trim())return;const id='custom-'+uid();setBanks(b=>[...b,{id,name:newBank.trim(),color:'#9CA3AF',secondary:'#9CA3AF',accountLabel:'Conta/Pix',accountBalance:0,creditLimit:0}]);setNewBank('')}
-  return <div className="max-w-4xl space-y-5"><div className="card p-5"><h2 className="font-bold text-lg" style={{fontFamily:'Manrope'}}>Orçamento mensal</h2><p className="text-xs muted mt-1 mb-4">A meta diária considera os gastos do mês selecionado e o limite mínimo definido aqui.</p><div className="grid sm:grid-cols-2 gap-4"><label className="text-xs font-semibold text-slate-600">Orçamento total mensal (R$)<input type="number" min="0" step=".01" className="field mt-1.5" value={budget} onChange={e=>setBudget(e.target.value)}/></label><label className="text-xs font-semibold text-slate-600">Alerta vermelho abaixo de (R$/dia)<input type="number" min="0" step=".01" className="field mt-1.5" value={dailySafetyThreshold} onChange={e=>setDailySafetyThreshold(e.target.value)}/><span className="block mt-1 font-normal muted">A meta fica vermelha quando cair abaixo deste valor.</span></label></div></div><div className="card p-5"><h2 className="font-bold text-lg" style={{fontFamily:'Manrope'}}>Contas e cartões</h2><p className="text-xs muted mt-1 mb-4">Defina o saldo inicial das contas e o limite de cada cartão.</p><div className="space-y-3">{banks.map((b,i)=><div key={b.id} className="rounded-xl border border-slate-100 p-4"><div className="flex items-center gap-2 mb-3"><span className="w-3 h-3 rounded-full" style={{background:bankAccent(b.id,theme)}}/><span className="font-bold text-sm">{b.name}</span>{i<4&&<span className="text-[10px] bg-slate-100 px-2 py-1 rounded-md muted">Pré-cadastrado</span>}</div><div className="grid sm:grid-cols-2 gap-3"><label className="text-xs font-semibold text-slate-600">Saldo inicial da conta (R$)<input type="number" step=".01" className="field mt-1.5" value={b.accountBalance??0} onChange={e=>setBanks(bs=>bs.map(x=>x.id===b.id?{...x,accountBalance:Number(e.target.value)}:x))}/></label><label className="text-xs font-semibold text-slate-600">Limite do cartão (R$)<input type="number" step=".01" className="field mt-1.5" value={b.creditLimit??0} onChange={e=>setBanks(bs=>bs.map(x=>x.id===b.id?{...x,creditLimit:Number(e.target.value)}:x))}/></label></div></div>)}</div><div className="flex gap-2 mt-4"><input className="field" placeholder="Nome da nova instituição" value={newBank} onChange={e=>setNewBank(e.target.value)}/><button onClick={addBank} className="btn btn-light whitespace-nowrap"><Plus size={15}/>Adicionar</button></div></div><div className="flex flex-wrap gap-2"><button onClick={save} className="btn btn-primary"><Check size={15}/>Salvar configurações</button></div><div className="rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 p-4 text-xs leading-relaxed"><ShieldCheck size={16} className="inline mr-2"/>Seus dados são sincronizados com sua conta Supabase. CSV e JSON ficam disponíveis para exportação manual.</div></div>
+  async function invite(event){
+    event.preventDefault();setConnectionBusy(true);setConnectionMessage('')
+    try{
+      const link=await requestUserLink(inviteEmail)
+      setConnectionMessage(link?.link_status==='accepted'?'Essa pessoa já está vinculada.':`Convite criado. Envie este código para a outra pessoa: ${link?.invite_code||''}`)
+      setInviteEmail('');await onConnectionsChanged()
+    }catch(error){setConnectionMessage(error.message||'Não foi possível criar o convite.')}
+    finally{setConnectionBusy(false)}
+  }
+  async function accept(code){
+    setConnectionBusy(true);setConnectionMessage('')
+    try{await acceptUserLink(code);setInviteCode('');setConnectionMessage('Vínculo aceito. Vocês já podem dividir despesas.');await onConnectionsChanged()}
+    catch(error){setConnectionMessage(error.message||'Não foi possível aceitar o convite.')}
+    finally{setConnectionBusy(false)}
+  }
+  return <div className="max-w-4xl space-y-5">
+    <div className="card p-5">
+      <h2 className="font-bold text-lg" style={{fontFamily:'Manrope'}}>Orçamento mensal</h2>
+      <p className="text-xs muted mt-1 mb-4">A meta diária considera o menor entre o orçamento mensal e o saldo inicial total das contas, descontando os gastos registrados.</p>
+      <div className="grid sm:grid-cols-2 gap-4">
+        <label className="text-xs font-semibold text-slate-600">Orçamento total mensal (R$)<input type="number" min="0" step=".01" className="field mt-1.5" value={budget} onChange={e=>setBudget(e.target.value)}/></label>
+        <label className="text-xs font-semibold text-slate-600">Alerta vermelho abaixo de (R$/dia)<input type="number" min="0" step=".01" className="field mt-1.5" value={dailySafetyThreshold} onChange={e=>setDailySafetyThreshold(e.target.value)}/><span className="block mt-1 font-normal muted">A meta fica vermelha quando cair abaixo deste valor.</span></label>
+      </div>
+    </div>
+
+    <section className="card p-5">
+      <h2 className="font-bold text-lg" style={{fontFamily:'Manrope'}}>Pessoas / Divisão de Contas</h2>
+      <p className="text-xs muted mt-1 mb-4">Convide alguém cadastrado pelo e-mail. A pessoa precisa aceitar o vínculo para aparecer nos gastos.</p>
+      <form onSubmit={invite} className="flex flex-col sm:flex-row gap-2 mb-3">
+        <input required type="email" className="field" placeholder="E-mail da pessoa" value={inviteEmail} onChange={event=>setInviteEmail(event.target.value)}/>
+        <button disabled={connectionBusy} className="btn btn-primary whitespace-nowrap"><Plus size={15}/>Convidar</button>
+      </form>
+      <form onSubmit={event=>{event.preventDefault();accept(inviteCode)}} className="flex flex-col sm:flex-row gap-2">
+        <input required className="field uppercase" placeholder="Código de vínculo" value={inviteCode} onChange={event=>setInviteCode(event.target.value.toUpperCase())}/>
+        <button disabled={connectionBusy} className="btn btn-light whitespace-nowrap">Aceitar convite</button>
+      </form>
+      {(connectionMessage||connectionError)&&<p role="status" className="text-xs muted mt-3">{connectionMessage||connectionError}</p>}
+      <div className="mt-4 divide-y divide-slate-100">
+        {connections.map(link=><div key={link.id} className="py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+          <div><div className="font-semibold text-sm">{link.partner_name||link.partner_email}</div><div className="text-xs muted">{link.partner_email}</div></div>
+          {link.status==='accepted'?<span className="text-xs rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-emerald-800">Vinculado</span>:link.invited_by===currentUserId?<span className="text-xs muted">Aguardando aceite · código {link.invite_code}</span>:<button className="btn btn-light" disabled={connectionBusy} onClick={()=>accept(link.invite_code)}>Aceitar convite</button>}
+        </div>)}
+        {!connections.length&&!connectionError&&<p className="text-xs muted pt-3">Nenhuma pessoa vinculada ainda.</p>}
+      </div>
+    </section>
+
+    <div className="card p-5">
+      <h2 className="font-bold text-lg" style={{fontFamily:'Manrope'}}>Contas e cartões</h2>
+      <p className="text-xs muted mt-1 mb-4">Defina o saldo inicial das contas e o limite de cada cartão.</p>
+      <div className="space-y-3">{banks.map((bank,index)=><div key={bank.id} className="rounded-xl border border-slate-100 p-4">
+        <div className="flex items-center gap-2 mb-3"><span className="w-3 h-3 rounded-full" style={{background:bankAccent(bank.id,theme)}}/><span className="font-bold text-sm">{bank.name}</span>{index<4&&<span className="text-[10px] bg-slate-100 px-2 py-1 rounded-md muted">Pré-cadastrado</span>}</div>
+        <div className="grid sm:grid-cols-2 gap-3">
+          <label className="text-xs font-semibold text-slate-600">Saldo inicial da conta (R$)<input type="number" step=".01" className="field mt-1.5" value={bank.accountBalance??0} onChange={event=>setBanks(items=>items.map(item=>item.id===bank.id?{...item,accountBalance:Number(event.target.value)}:item))}/></label>
+          <label className="text-xs font-semibold text-slate-600">Limite do cartão (R$)<input type="number" step=".01" className="field mt-1.5" value={bank.creditLimit??0} onChange={event=>setBanks(items=>items.map(item=>item.id===bank.id?{...item,creditLimit:Number(event.target.value)}:item))}/></label>
+        </div>
+      </div>)}</div>
+      <div className="flex gap-2 mt-4"><input className="field" placeholder="Nome da nova instituição" value={newBank} onChange={event=>setNewBank(event.target.value)}/><button type="button" onClick={addBank} className="btn btn-light whitespace-nowrap"><Plus size={15}/>Adicionar</button></div>
+    </div>
+    <div className="flex flex-wrap gap-2"><button onClick={save} className="btn btn-primary"><Check size={15}/>Salvar configurações</button></div>
+    <div className="rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 p-4 text-xs leading-relaxed"><ShieldCheck size={16} className="inline mr-2"/>Seus dados são sincronizados com sua conta Supabase. CSV e JSON ficam disponíveis para exportação manual.</div>
+  </div>
 }
