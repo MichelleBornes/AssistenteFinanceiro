@@ -30,19 +30,26 @@ export function emptyFinanceData() {
     version: 1,
     settings: { monthlyBudget: 3200, cycleDay: 1, dailySafetyThreshold: 40 },
     monthBudgets: {},
+    fixedExpenses: [],
     banks: BANKS.map(bank => ({ ...bank, accountBalance: 0, creditLimit: 0 })),
     transactions: []
   }
 }
 
 export async function loadFinanceData(userId) {
-  const [transactionsResult, budgetsResult, accountsResult] = await Promise.all([
+  const [transactionsResult, budgetsResult, accountsResult, fixedExpensesResult] = await Promise.all([
     supabase.from('transactions').select('*').or(`user_id.eq.${userId},shared_with_user_id.eq.${userId}`),
     supabase.from('budgets').select('*').eq('user_id', userId),
-    supabase.from('accounts').select('*').eq('user_id', userId)
+    supabase.from('accounts').select('*').eq('user_id', userId),
+    supabase.from('fixed_expenses').select('*').eq('user_id', userId)
   ])
-  for (const result of [transactionsResult, budgetsResult, accountsResult]) {
-    if (result.error) throw result.error
+  for (const result of [transactionsResult, budgetsResult, accountsResult, fixedExpensesResult]) {
+    if (result.error) {
+      if(result.error.code==='42P01'||result.error.code==='PGRST205'){
+        throw new Error('Atualize o Supabase executando supabase/migrations/20261118_fixed_expenses.sql no SQL Editor.')
+      }
+      throw result.error
+    }
   }
 
   const budgets = budgetsResult.data || []
@@ -75,7 +82,12 @@ export async function loadFinanceData(userId) {
     },
     monthBudgets,
     banks,
-    hasCloudData: Boolean((transactionsResult.data || []).length || budgets.length || remoteAccounts.length),
+    fixedExpenses: (fixedExpensesResult.data||[]).map(row=>({
+      id:row.id,description:row.description,amount:Number(row.amount),category:row.category,
+      bank:row.bank,method:row.method,dueDay:Number(row.due_day),startMonth:row.start_month,
+      endMonth:row.end_month||'',createdAt:row.created_at?new Date(row.created_at).getTime():Date.now()
+    })),
+    hasCloudData: Boolean((transactionsResult.data || []).length || budgets.length || remoteAccounts.length || (fixedExpensesResult.data||[]).length),
     transactions: (transactionsResult.data || []).map(row => {
       const payerId=row.payer_id||row.user_id
       const isPayer=payerId===userId
@@ -99,6 +111,7 @@ export async function loadFinanceData(userId) {
         installmentNumber: row.installment_number ?? undefined,
         installmentCount: row.installment_count ?? undefined,
         installmentGroup: row.installment_group_id ?? undefined,
+        fixedExpenseId:row.fixed_expense_id||undefined,
         createdAt: row.created_at ? new Date(row.created_at).getTime() : Date.now()
       }
     })
@@ -197,7 +210,17 @@ function transactionRow(item, userId) {
     amount: transactionTotal, category: item.category || 'Outros', bank: item.bank || 'nubank',
     method: item.method || 'debit', installment_group_id: item.installmentGroup || null,
     installment_number: item.installmentNumber ?? null, installment_count: item.installmentCount ?? null,
-    installment_total: item.installmentTotal ?? null, created_at: item.createdAt ? new Date(item.createdAt).toISOString() : new Date().toISOString()
+    installment_total: item.installmentTotal ?? null, fixed_expense_id:item.fixedExpenseId||null,
+    created_at: item.createdAt ? new Date(item.createdAt).toISOString() : new Date().toISOString()
+  }
+}
+
+function fixedExpenseRow(item,userId){
+  return {
+    id:String(item.id),user_id:userId,description:item.description,amount:Number(item.amount),
+    category:item.category||'Contas',bank:item.bank||'nubank',method:item.method||'debit',
+    due_day:Number(item.dueDay||1),start_month:item.startMonth,end_month:item.endMonth||null,
+    created_at:item.createdAt?new Date(item.createdAt).toISOString():new Date().toISOString()
   }
 }
 
@@ -245,6 +268,19 @@ export async function syncFinanceData(userId, before, after) {
     if (error) throw error
   }
 
+  const oldFixedExpenses=new Map((before?.fixedExpenses||[]).map(item=>[String(item.id),item]))
+  const newFixedExpenses=new Map((after.fixedExpenses||[]).map(item=>[String(item.id),item]))
+  const changedFixedExpenses=[...newFixedExpenses.values()].filter(item=>!same(item,oldFixedExpenses.get(String(item.id))))
+  const removedFixedExpenseIds=[...oldFixedExpenses.keys()].filter(id=>!newFixedExpenses.has(id))
+  if(changedFixedExpenses.length){
+    const {error}=await supabase.from('fixed_expenses').upsert(changedFixedExpenses.map(item=>fixedExpenseRow(item,userId)))
+    if(error)throw error
+  }
+  if(removedFixedExpenseIds.length){
+    const {error}=await supabase.from('fixed_expenses').delete().eq('user_id',userId).in('id',removedFixedExpenseIds)
+    if(error)throw error
+  }
+
   const oldAccounts = new Map((before?.banks || []).map(item => [String(item.id), item]))
   const newAccounts = new Map((after.banks || []).map(item => [String(item.id), item]))
   const changedAccounts = [...newAccounts.values()].filter(item => !same(item, oldAccounts.get(String(item.id))))
@@ -280,6 +316,7 @@ export async function importLegacyData(userId, legacyData) {
     ...defaults,
     settings: isDemoBackup ? defaults.settings : { ...defaults.settings, ...(legacyData.settings || {}) },
     monthBudgets: isDemoBackup ? {} : (legacyData.monthBudgets || {}),
+    fixedExpenses:isDemoBackup?[]:(Array.isArray(legacyData.fixedExpenses)?legacyData.fixedExpenses:[]),
     banks: isDemoBackup ? defaults.banks : (legacyData.banks || []).map(bank => {
       const preset = BANKS.find(item => item.id === bank.id)
       return { ...bank, color: preset?.color || bank.color || '#9CA3AF', secondary: preset?.secondary || bank.secondary || '#9CA3AF' }

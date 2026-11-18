@@ -120,6 +120,7 @@ select.field {
 .btn-light { color:var(--text); background:transparent; border-color:var(--border-strong); }
 .btn-light:hover { background:var(--surface-muted); border-color:var(--border-strong); }
 .btn-danger { color:var(--text); background:transparent; border-color:var(--border-strong); }
+.btn-register-installment { gap:12px; padding-inline:28px; }
 .btn-primary svg,.btn-light svg { flex:none; }
 .auth-switch { color:var(--text); }
 .auth-switch-link { color:var(--primary); text-decoration-thickness:1.5px; text-underline-offset:4px; }

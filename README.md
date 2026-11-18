@@ -7,6 +7,8 @@ Assistente financeiro pessoal para registrar despesas, acompanhar o orçamento e
 - Cadastro de gastos por formulário ou registro rápido por texto.
 - Seleção da instituição e do método de pagamento, com compras parceladas em até 24 vezes.
 - Distribuição automática das parcelas pelos meses seguintes e acompanhamento do valor comprometido.
+- Cadastro de contas fixas recorrentes, com previsão mensal e registro de pagamento integrado às transações.
+- Registro de compras parceladas que já começaram, com parcelas restantes e previsão de término.
 - Orçamento mensal e cálculo de quanto pode ser gasto por dia, considerando os saldos cadastrados e as despesas do período.
 - Resumos, gráficos, filtros e navegação entre meses.
 - Convites para conectar outra pessoa, dividir despesas e acompanhar acertos entre usuários.
@@ -16,6 +18,8 @@ Assistente financeiro pessoal para registrar despesas, acompanhar o orçamento e
 - Temas claro e escuro e interface adaptável a celular, tablet e desktop.
 
 As instituições pré-cadastradas são Nubank, Santander, PicPay e Banco do Brasil. Os saldos e limites são informados pela pessoa usuária; o sistema não acessa contas bancárias nem importa faturas automaticamente.
+
+Para habilitar as contas fixas em uma instalação Supabase existente, execute `supabase/migrations/20261118_fixed_expenses.sql` no SQL Editor do projeto.
 
 ## Tecnologias
 
