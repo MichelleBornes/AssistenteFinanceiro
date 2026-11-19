@@ -19,7 +19,7 @@ Assistente financeiro pessoal para registrar despesas, acompanhar o orçamento e
 
 As instituições pré-cadastradas são Nubank, Santander, PicPay e Banco do Brasil. Os saldos e limites são informados pela pessoa usuária; o sistema não acessa contas bancárias nem importa faturas automaticamente.
 
-Para habilitar as contas fixas em uma instalação Supabase existente, execute `supabase/migrations/20261118_fixed_expenses.sql` no SQL Editor do projeto.
+Em uma instalação Supabase existente, execute as migrações em `supabase/migrations` no SQL Editor do projeto para habilitar as contas fixas e identificar compras no cartão de outra pessoa.
 
 ## Tecnologias
 

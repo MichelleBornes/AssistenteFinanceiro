@@ -110,20 +110,24 @@ function createInstallments(transaction,count){
   }))
 }
 
-function createRemainingInstallments(transaction,totalCount,firstNumber){
+function createRemainingInstallments(transaction,totalCount,firstNumber,groupId=uid()){
   const totalCents=Math.round(Number(transaction.amount)*100)
+  const payerTotalCents=transaction.payerShareTotal==null?totalCents:Math.round(Number(transaction.payerShareTotal)*100)
   const baseCents=Math.floor(totalCents/totalCount)
   const extraCents=totalCents%totalCount
-  const group=uid()
+  const payerBaseCents=Math.floor(payerTotalCents/totalCount)
+  const payerExtraCents=payerTotalCents%totalCount
   return Array.from({length:totalCount-firstNumber+1},(_,offset)=>{
     const number=firstNumber+offset
     const installmentCents=baseCents+(number-1<extraCents?1:0)
-    const amount=installmentCents/100
+    const payerCents=payerBaseCents+(number-1<payerExtraCents?1:0)
+    const amount=payerCents/100
     return {
       ...transaction,id:uid(),date:addMonthsToDate(transaction.date,offset),amount,
-      transactionTotal:amount,payerShare:amount,sharedShare:0,installmentGroup:group,
+      transactionTotal:installmentCents/100,payerShare:amount,sharedShare:(installmentCents-payerCents)/100,
+      isShared:Boolean(transaction.sharedWithUserId),isPayer:true,installmentGroup:groupId,
       installmentNumber:number,installmentCount:totalCount,installmentTotal:totalCents/100,
-      createdAt:Date.now()
+      createdAt:transaction.createdAt||Date.now()
     }
   })
 }
@@ -152,6 +156,7 @@ export default function App(){
   const [quick,setQuick]=useState('')
   const [quickBank,setQuickBank]=useState('')
   const [quickMethod,setQuickMethod]=useState('debit')
+  const [quickCardOwner,setQuickCardOwner]=useState('mine')
   const [quickInstallments,setQuickInstallments]=useState('2')
   const [quickSplitEnabled,setQuickSplitEnabled]=useState(false)
   const [quickSplitPerson,setQuickSplitPerson]=useState('')
@@ -162,6 +167,7 @@ export default function App(){
   const [filters,setFilters]=useState({bank:'all',method:'all',category:'all',search:''})
   const [tab,setTab]=useState('dashboard')
   const [editingFixedExpense,setEditingFixedExpense]=useState(null)
+  const [editingInstallmentGroup,setEditingInstallmentGroup]=useState(null)
   const [commitmentModal,setCommitmentModal]=useState(null)
   const fileRef=useRef(null)
   useEffect(()=>{
@@ -241,10 +247,12 @@ export default function App(){
     const previous=dataRef.current||emptyFinanceData()
     dataRef.current=next;setData(next);setSyncState('saving');setSyncError('')
     const userId=session?.user?.id
-    if(!userId)return
-    syncQueue.current=syncQueue.current.catch(()=>{}).then(()=>syncFinanceData(userId,previous,next))
-      .then(()=>setSyncState('synced'))
-      .catch(error=>{setSyncError(error.message||'Falha ao salvar na nuvem.');setSyncState('error')})
+    if(!userId)return Promise.resolve()
+    const request=syncQueue.current.catch(()=>{}).then(()=>syncFinanceData(userId,previous,next))
+    syncQueue.current=request
+    request.then(()=>setSyncState('synced'),error=>{setSyncError(error.message||'Falha ao salvar na nuvem.');setSyncState('error')})
+    request.catch(()=>{})
+    return request
   }
   const allMonths=useMemo(()=>[...new Set(data.transactions.map(t=>monthKey(t.date)))].sort(),[data.transactions])
   const people=connections.filter(link=>link.status==='accepted').map(link=>({id:link.partner_id,name:link.partner_name||link.partner_email?.split('@')[0]||'Pessoa vinculada',email:link.partner_email}))
@@ -254,8 +262,8 @@ export default function App(){
   const selectedBudget=period==='all'?Number(data.settings.monthlyBudget):Number(data.monthBudgets?.[selectedMonth]??data.settings.monthlyBudget)
   const dailySafetyThreshold=Math.max(0,Number(data.settings.dailySafetyThreshold??40)||0)
   const total=monthTransactions.reduce((s,t)=>s+t.amount,0)
-  const credit=monthTransactions.filter(t=>t.method==='credit').reduce((s,t)=>s+t.amount,0)
-  const debit=total-credit
+  const credit=monthTransactions.filter(t=>t.method==='credit'&&t.cardOwner!=='other').reduce((s,t)=>s+t.amount,0)
+  const debit=monthTransactions.filter(t=>t.method==='debit').reduce((sum,transaction)=>sum+transaction.amount,0)
   const dominant=BANKS.map(b=>({ ...b, value:monthTransactions.filter(t=>t.bank===b.id).reduce((s,t)=>s+t.amount,0)})).sort((a,b)=>b.value-a.value)[0]
   const [year,month]=selectedMonth.split('-').map(Number)
   const daysInMonth=new Date(year,month,0).getDate()
@@ -304,12 +312,59 @@ export default function App(){
     if(!window.confirm(`Excluir “${expense.description}” da lista de contas fixas? Os pagamentos já registrados continuarão no histórico.`))return
     commitData({...data,fixedExpenses:(data.fixedExpenses||[]).filter(item=>item.id!==expense.id)});notify('Conta fixa excluída.')
   }
-  function savePastInstallment(purchase){
-    const rows=createRemainingInstallments({...purchase,payerId:session.user.id},purchase.installmentCount,purchase.currentInstallment)
+  function editInstallmentGroup(group){
+    const rows=[...group.rows].sort((a,b)=>Number(a.installmentNumber)-Number(b.installmentNumber))
+    const totalCount=Math.max(...rows.map(row=>Number(row.installmentCount)||0),...rows.map(row=>Number(row.installmentNumber)||0))
+    const next=rows.find(row=>monthKey(row.date)>=selectedMonth)||rows[0]
+    const first=rows[0]
+    const rowTotal=Number(first.transactionTotal||first.amount)
+    const payerRatio=rowTotal>0?Number(first.payerShare??first.amount)/rowTotal:1
+    setEditingInstallmentGroup({
+      ...group,initial:{
+        description:first.description,amount:Number(first.installmentTotal||first.transactionTotal||first.amount),
+        category:first.category,bank:first.bank,date:next.date,installmentCount:totalCount,
+        currentInstallment:next.installmentNumber,installmentGroup:group.id,cardOwner:first.cardOwner||'mine',
+        createdAt:first.createdAt,sharedWithUserId:first.sharedWithUserId,
+        payerRatio
+      }
+    })
+    setCommitmentModal('installment')
+  }
+  function removeInstallmentGroup(group){
+    const name=group.rows[0]?.description||'esta compra'
+    if(!window.confirm(`Remover “${name}” e todas as parcelas vinculadas a esta compra?`))return
+    commitData({...data,transactions:data.transactions.filter(transaction=>transaction.installmentGroup!==group.id)})
+    notify('Compra parcelada e parcelas vinculadas removidas.')
+  }
+  async function savePastInstallment(purchase){
+    const previous=dataRef.current||data
+    const group=editingInstallmentGroup
+    const existingRows=group?.rows||[]
+    const existingIds=new Map(existingRows.map(row=>[row.installmentNumber,row.id]))
+    const purchaseTotal=Number(purchase.amount)
+    const sharedWithUserId=group?.rows[0]?.sharedWithUserId||purchase.sharedWithUserId
+    const payerRatio=Math.max(0,Math.min(1,Number(purchase.payerRatio??1)))
+    const payerShareTotal=sharedWithUserId?Math.round(purchaseTotal*payerRatio*100)/100:purchaseTotal
+    const rows=createRemainingInstallments({
+      ...purchase,payerId:group?.rows[0]?.payerId||session.user.id,
+      sharedWithUserId,payerShareTotal,createdAt:group?.rows[0]?.createdAt
+    },purchase.installmentCount,purchase.currentInstallment,group?.id)
+      .map(row=>({...row,id:existingIds.get(row.installmentNumber)||row.id}))
     const monthBudgets={...(data.monthBudgets||{})}
     rows.forEach(row=>{monthBudgets[monthKey(row.date)]??=data.settings.monthlyBudget})
-    commitData({...data,monthBudgets,transactions:[...rows,...data.transactions]})
-    setCommitmentModal(null);notify(`Parcelas registradas até ${fmtMonth(monthKey(rows[rows.length-1].date))}.`)
+    const transactions=group
+      ?[...data.transactions.filter(transaction=>transaction.installmentGroup!==group.id||(
+        Number(transaction.installmentNumber)<Number(purchase.currentInstallment)&&transaction.date<purchase.date
+      )),...rows]
+      :[...rows,...data.transactions]
+    try{
+      await commitData({...data,monthBudgets,transactions})
+      setCommitmentModal(null);setEditingInstallmentGroup(null)
+      notify(group?`Compra parcelada atualizada até ${fmtMonth(monthKey(rows[rows.length-1].date))}.`:`Parcelas registradas até ${fmtMonth(monthKey(rows[rows.length-1].date))}.`)
+    }catch(error){
+      dataRef.current=previous;setData(previous);setSyncError(error.message||'Falha ao salvar na nuvem.');setSyncState('error')
+      notify(error.message||'Não foi possível salvar a compra parcelada.')
+    }
   }
   function registerFixedPayment(expense){
     const dueDay=Math.min(expense.dueDay,new Date(year,month,0).getDate())
@@ -334,7 +389,7 @@ export default function App(){
       else payerShare=Math.round(totalAmount*50)/100
     }
     const sharedShare=Math.round((totalAmount-payerShare)*100)/100
-    const prepared={...tx,amount:payerShare,transactionTotal:totalAmount,payerShare,sharedShare,payerId:session.user.id,sharedWithUserId:sharedWithUserId||undefined,isPayer:true,isShared:Boolean(sharedWithUserId)}
+    const prepared={...tx,amount:payerShare,transactionTotal:totalAmount,payerShare,sharedShare,payerId:session.user.id,sharedWithUserId:sharedWithUserId||undefined,isPayer:true,isShared:Boolean(sharedWithUserId),cardOwner:tx.method==='credit'?(tx.cardOwner||'mine'):'mine'}
     if(editing){commitData({...data,monthBudgets:{...(data.monthBudgets||{}),[monthKey(prepared.date)]:data.monthBudgets?.[monthKey(prepared.date)]??data.settings.monthlyBudget},transactions:data.transactions.map(t=>t.id===editing.id?{...prepared,id:editing.id}:t)});notify('Transação atualizada.')}
     else addTransaction(prepared)
     setModal(null);setEditing(null)
@@ -344,8 +399,8 @@ export default function App(){
     if(quickSplitEnabled&&!people.some(person=>person.id===quickSplitPerson)){notify('Selecione uma pessoa vinculada para dividir a conta.');return}
     const installmentCount=quickMethod==='installments'?Number(quickInstallments):1
     const method=quickMethod==='debit'?'debit':'credit'
-    const transaction={...parsed,bank:quickBank,installmentCount,method,...(quickSplitEnabled?{sharedWithUserId:quickSplitPerson,splitMode:'equal',splitValue:50}:{})}
-    saveTransaction({...transaction,date:dateISO(today),splitEnabled:Boolean(transaction.sharedWithUserId)});setQuick('');setQuickInstallments('2');setQuickMethod('debit');setQuickSplitEnabled(false);setQuickSplitPerson('')
+    const transaction={...parsed,bank:quickBank,installmentCount,method,cardOwner:method==='credit'?quickCardOwner:'mine',...(quickSplitEnabled?{sharedWithUserId:quickSplitPerson,splitMode:'equal',splitValue:50}:{})}
+    saveTransaction({...transaction,date:dateISO(today),splitEnabled:Boolean(transaction.sharedWithUserId)});setQuick('');setQuickInstallments('2');setQuickMethod('debit');setQuickCardOwner('mine');setQuickSplitEnabled(false);setQuickSplitPerson('')
   }
   function removeTransaction(id){
     const target=data.transactions.find(t=>t.id===id)
@@ -379,7 +434,7 @@ export default function App(){
   const filtered=monthTransactions.filter(t=>(filters.bank==='all'||t.bank===filters.bank)&&(filters.method==='all'||t.method===filters.method)&&(filters.category==='all'||t.category===filters.category)&&(!filters.search||t.description.toLowerCase().includes(filters.search.toLowerCase())))
   const personalTransactions=filtered.filter(transaction=>!transaction.isShared)
   const sharedTransactions=filtered.filter(transaction=>transaction.isShared)
-  const bankSummary=BANKS.map(b=>({...b,color:bankAccent(b.id,theme),debit:monthTransactions.filter(t=>t.bank===b.id&&t.method==='debit').reduce((s,t)=>s+t.amount,0),credit:monthTransactions.filter(t=>t.bank===b.id&&t.method==='credit').reduce((s,t)=>s+t.amount,0)}))
+  const bankSummary=BANKS.map(b=>({...b,color:bankAccent(b.id,theme),debit:monthTransactions.filter(t=>t.bank===b.id&&t.method==='debit').reduce((s,t)=>s+t.amount,0),credit:monthTransactions.filter(t=>t.bank===b.id&&t.method==='credit'&&t.cardOwner!=='other').reduce((s,t)=>s+t.amount,0)}))
   const dailyChart=Array.from({length:new Date(year,month,0).getDate()},(_,i)=>{const day=i+1;const key=`${selectedMonth}-${String(day).padStart(2,'0')}`;return {day:String(day),gasto:monthTransactions.filter(t=>t.date===key).reduce((s,t)=>s+t.amount,0),meta:daily}})
   const monthlyChart=allMonths.map(k=>{const row={mes:new Date(Number(k.slice(0,4)),Number(k.slice(5,7))-1,1).toLocaleDateString('pt-BR',{month:'short',year:'2-digit'})};BANKS.forEach(b=>row[b.id]=data.transactions.filter(t=>monthKey(t.date)===k&&t.bank===b.id).reduce((s,t)=>s+t.amount,0));return row})
   const categoryChart=CATEGORIES.map(c=>({name:c,value:monthTransactions.filter(t=>t.category===c).reduce((s,t)=>s+t.amount,0)})).filter(x=>x.value>0)
@@ -389,8 +444,15 @@ export default function App(){
   const palette=chartColors.palette
   const periodLabel=period==='all'?'Visão geral':fmtMonth(period)
   const monthOptions=[...new Set([...allMonths,...Array.from({length:37},(_,i)=>shiftMonth(currentKey,i-12))])].sort()
-  const futureCommitments=data.transactions.filter(t=>t.installmentGroup&&monthKey(t.date)>selectedMonth)
-  const futureCommitted=futureCommitments.reduce((sum,t)=>sum+t.amount,0)
+  const nextMonth=shiftMonth(selectedMonth,1)
+  const nextMonthInstallments=new Map()
+  data.transactions.forEach(transaction=>{
+    if(!transaction.installmentGroup||monthKey(transaction.date)!==nextMonth)return
+    const current=nextMonthInstallments.get(transaction.installmentGroup)
+    if(!current||Number(transaction.installmentNumber)<Number(current.installmentNumber))nextMonthInstallments.set(transaction.installmentGroup,transaction)
+  })
+  const futureCommitments=[...nextMonthInstallments.values()]
+  const futureCommitted=futureCommitments.reduce((sum,transaction)=>sum+Math.round(Number(transaction.transactionTotal??transaction.amount)*100),0)/100
   const settlementMap=new Map()
   const settlementTransactions=period==='all'?data.transactions.filter(transaction=>monthKey(transaction.date)===currentKey):monthTransactions
   for(const transaction of settlementTransactions){
@@ -405,7 +467,7 @@ export default function App(){
   }
   const settlementBalances=[...settlementMap.values()]
   const personName=id=>people.find(person=>person.id===id)?.name||'Pessoa vinculada'
-  const renderTransactionTable=transactions=><div className="overflow-x-auto"><table className="w-full text-left min-w-[700px]"><thead><tr className="text-[10px] uppercase tracking-wider muted border-b border-slate-100"><th className="py-3 font-semibold">Descrição</th><th className="py-3 font-semibold">Data</th><th className="py-3 font-semibold">Instituição</th><th className="py-3 font-semibold">Método</th><th className="py-3 font-semibold text-right">Sua parte</th><th className="py-3"></th></tr></thead><tbody>{transactions.map(t=><tr key={t.id} className="border-b border-slate-50 last:border-0 hover:bg-slate-50/70"><td className="py-3"><div className="font-semibold text-sm">{t.description}</div><div className="flex flex-wrap items-center gap-1.5 text-[11px] muted mt-1"><span className="category-badge" style={categoryStyle(t.category,theme)}>{t.category}</span>{t.installmentCount>1&&<span className="inline-flex rounded-md bg-violet-50 px-2 py-1 font-semibold text-violet-700">Parcela {t.installmentNumber}/{t.installmentCount}</span>}{t.isShared&&<span className="inline-flex rounded-md bg-emerald-50 px-2 py-1 font-semibold text-emerald-800">Dividido {t.isPayer?'com':'por'} {personName(t.isPayer?t.sharedWithUserId:t.payerId)}</span>}{t.isShared&&t.isSettled&&<span className="inline-flex rounded-md bg-slate-100 px-2 py-1 font-semibold">Quitado</span>}</div>{t.isShared&&<div className="text-[11px] muted mt-1">Total {money(t.transactionTotal)} · sua parte {money(t.amount)} · {t.isPayer?`a receber ${money(t.sharedShare)}`:`a pagar ${money(t.sharedShare)}`}</div>}</td><td className="py-3 text-xs text-slate-500">{new Date(t.date+'T12:00:00').toLocaleDateString('pt-BR')}</td><td className="py-3"><span className="inline-flex items-center gap-2 text-xs font-semibold"><span className="w-2 h-2 rounded-full" style={{background:bankAccent(t.bank,theme)}}/>{data.banks.find(b=>b.id===t.bank)?.name||bankName(t.bank)}</span></td><td className="py-3"><span className={`text-[10px] font-bold px-2 py-1 rounded-md ${t.method==='credit'?'bg-blue-50 text-blue-700':'bg-emerald-50 text-emerald-700'}`}>{methodLabel(t.method)}</span></td><td className="py-3 text-right text-sm font-bold">{money(t.amount)}</td><td className="py-3 text-right">{t.isPayer&&<><button title="Editar" onClick={()=>{setEditing(t);setModal('transaction')}} className="p-2 text-slate-400 hover:text-violet-700"><Pencil size={14}/></button><button title="Excluir" onClick={()=>removeTransaction(t.id)} className="p-2 text-slate-400 hover:text-rose-600"><Trash2 size={14}/></button></>}</td></tr>)}</tbody></table>{!transactions.length&&<div className="py-8 text-center text-sm muted">Nenhuma transação nesta seção.</div>}</div>
+  const renderTransactionTable=transactions=><div className="overflow-x-auto"><table className="w-full text-left min-w-[700px]"><thead><tr className="text-[10px] uppercase tracking-wider muted border-b border-slate-100"><th className="py-3 font-semibold">Descrição</th><th className="py-3 font-semibold">Data</th><th className="py-3 font-semibold">Instituição</th><th className="py-3 font-semibold">Método</th><th className="py-3 font-semibold text-right">Sua parte</th><th className="py-3"></th></tr></thead><tbody>{transactions.map(t=><tr key={t.id} className="border-b border-slate-50 last:border-0 hover:bg-slate-50/70"><td className="py-3"><div className="font-semibold text-sm">{t.description}</div><div className="flex flex-wrap items-center gap-1.5 text-[11px] muted mt-1"><span className="category-badge" style={categoryStyle(t.category,theme)}>{t.category}</span>{t.installmentCount>1&&<span className="inline-flex rounded-md bg-violet-50 px-2 py-1 font-semibold text-violet-700">Parcela {t.installmentNumber}/{t.installmentCount}</span>}{t.cardOwner==='other'&&<span className="inline-flex rounded-md bg-slate-100 px-2 py-1 font-semibold">Cartão de outra pessoa</span>}{t.isShared&&<span className="inline-flex rounded-md bg-emerald-50 px-2 py-1 font-semibold text-emerald-800">Dividido {t.isPayer?'com':'por'} {personName(t.isPayer?t.sharedWithUserId:t.payerId)}</span>}{t.isShared&&t.isSettled&&<span className="inline-flex rounded-md bg-slate-100 px-2 py-1 font-semibold">Quitado</span>}</div>{t.isShared&&<div className="text-[11px] muted mt-1">Total {money(t.transactionTotal)} · sua parte {money(t.amount)} · {t.isPayer?`a receber ${money(t.sharedShare)}`:`a pagar ${money(t.sharedShare)}`}</div>}</td><td className="py-3 text-xs text-slate-500">{new Date(t.date+'T12:00:00').toLocaleDateString('pt-BR')}</td><td className="py-3"><span className="inline-flex items-center gap-2 text-xs font-semibold"><span className="w-2 h-2 rounded-full" style={{background:bankAccent(t.bank,theme)}}/>{data.banks.find(b=>b.id===t.bank)?.name||bankName(t.bank)}</span></td><td className="py-3"><span className={`text-[10px] font-bold px-2 py-1 rounded-md ${t.method==='credit'?'bg-blue-50 text-blue-700':'bg-emerald-50 text-emerald-700'}`}>{methodLabel(t.method)}</span></td><td className="py-3 text-right text-sm font-bold">{money(t.amount)}</td><td className="py-3 text-right">{t.isPayer&&<><button title="Editar" onClick={()=>{setEditing(t);setModal('transaction')}} className="p-2 text-slate-400 hover:text-violet-700"><Pencil size={14}/></button><button title="Excluir" onClick={()=>removeTransaction(t.id)} className="p-2 text-slate-400 hover:text-rose-600"><Trash2 size={14}/></button></>}</td></tr>)}</tbody></table>{!transactions.length&&<div className="py-8 text-center text-sm muted">Nenhuma transação nesta seção.</div>}</div>
   const screenTitle=tab==='dashboard'?(period==='all'?'Visão geral':`Resumo de ${fmtMonth(selectedMonth)}`):tab==='transactions'?'Transações':tab==='commitments'?'Contas e parcelas':'Configurações'
   const screenLabel=tab==='dashboard'?'RESUMO MENSAL':tab==='transactions'?'MOVIMENTAÇÕES':tab==='commitments'?'COMPROMISSOS':'PREFERÊNCIAS'
   const screenDescription=tab==='dashboard'?'Gastos, metas e compromissos em um só lugar.':tab==='transactions'?`Gastos e parcelas no período: ${periodLabel}.`:tab==='commitments'?`Contas fixas e compras parceladas em ${periodLabel}.`:'Orçamento, instituições e pessoas vinculadas.'
@@ -439,6 +501,7 @@ export default function App(){
           <div className="flex-1"><div className="text-sm font-bold">Adicionar por texto <span className="text-xs font-normal muted ml-1">Escreva a descrição e o valor, por exemplo “Jantar 100”.</span></div><input value={quick} onChange={e=>setQuick(e.target.value)} className="quick-text-input w-full text-sm mt-1 placeholder:text-slate-400" placeholder="Descrição e valor do gasto" aria-label="Descrição e valor do gasto"/></div>
           <label className="text-xs font-semibold muted md:w-48">Instituição<select aria-label="Instituição do gasto rápido" className="field mt-1 text-sm" value={quickBank} onChange={e=>setQuickBank(e.target.value)}><option value="">Selecione</option>{data.banks.map(bank=><option key={bank.id} value={bank.id}>{bank.name}</option>)}</select></label>
           <label className="text-xs font-semibold muted md:w-44">Forma de pagamento<select aria-label="Forma de pagamento do gasto rápido" className="field mt-1 text-sm" value={quickMethod} onChange={e=>setQuickMethod(e.target.value)}><option value="debit">Débito / Pix</option><option value="credit">Crédito à vista</option><option value="installments">Crédito parcelado</option></select></label>
+          {quickMethod!=='debit'&&<label className="text-xs font-semibold muted md:w-48">Cartão utilizado<select aria-label="Titular do cartão no gasto rápido" className="field mt-1 text-sm" value={quickCardOwner} onChange={e=>setQuickCardOwner(e.target.value)}><option value="mine">Meu cartão</option><option value="other">Cartão de outra pessoa</option></select></label>}
           <button className="btn btn-primary shrink-0" type="submit">Registrar gasto <ArrowUpRight size={15}/></button>
         </div>
         <div className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-3 border-t border-slate-100 pt-3">
@@ -474,13 +537,13 @@ export default function App(){
       {tab==='dashboard'&&<section className="card p-5 mb-5"><div className="flex items-start justify-between gap-3 mb-4"><div><h2 className="font-bold" style={{fontFamily:'Manrope'}}>Acerto de Contas</h2><p className="text-xs muted mt-1">Pendências de despesas compartilhadas em {fmtMonth(selectedMonth)}.</p></div><span className="text-xs muted">{settlementBalances.length} pessoa(s)</span></div>{settlementBalances.length?<div className="divide-y divide-slate-100">{settlementBalances.map(balance=>{const positive=balance.net>0;const negative=balance.net<0;return <div key={balance.partnerId} className="py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3"><div className="flex-1"><div className="text-sm muted">{positive?`${personName(balance.partnerId)} te deve`:negative?`Você deve para ${personName(balance.partnerId)}`:`Saldo zerado com ${personName(balance.partnerId)}`}</div><div className="flex items-center gap-2 mt-1.5"><span className="settlement-amount text-2xl">{money(Math.abs(balance.net))}</span><span className={`settlement-pill ${positive?'positive':negative?'negative':'neutral'}`}>{positive?'A receber':negative?'A pagar':'Quitado'}</span></div><div className="text-xs muted mt-1">{balance.transactionIds.length} gasto(s) ainda não quitado(s)</div></div><button className="btn btn-light" onClick={()=>settleTransactions(balance.transactionIds)}>Marcar como acertado / quitado</button></div>})}</div>:<div className="text-sm muted py-2">Nenhum acerto pendente neste mês.</div>}</section>}
 
       {tab==='settings'?<Settings data={data} onSave={saveSettings} theme={theme} connections={connections} currentUserId={session.user.id} connectionError={connectionError} onConnectionsChanged={refreshConnections}/>:
-      tab==='commitments'?<Commitments data={data} banks={data.banks} month={selectedMonth} theme={theme} paidFixedExpenseIds={paidFixedExpenseIds} onAddFixed={()=>{setEditingFixedExpense(null);setCommitmentModal('fixed')}} onEditFixed={expense=>{setEditingFixedExpense(expense);setCommitmentModal('fixed')}} onDeleteFixed={deleteFixedExpense} onMarkPaid={registerFixedPayment} onUndoPayment={undoFixedPayment} onAddInstallment={()=>setCommitmentModal('installment')} onEditInstallment={transaction=>{setEditing(transaction);setModal('transaction')}} onRemoveInstallment={removeTransaction} commitmentModal={commitmentModal} editingFixedExpense={editingFixedExpense} onCloseModal={()=>{setCommitmentModal(null);setEditingFixedExpense(null)}} onSaveFixed={saveFixedExpense} onSaveInstallment={savePastInstallment}/>:
+      tab==='commitments'?<Commitments data={data} banks={data.banks} month={selectedMonth} theme={theme} paidFixedExpenseIds={paidFixedExpenseIds} onAddFixed={()=>{setEditingFixedExpense(null);setCommitmentModal('fixed')}} onEditFixed={expense=>{setEditingFixedExpense(expense);setCommitmentModal('fixed')}} onDeleteFixed={deleteFixedExpense} onMarkPaid={registerFixedPayment} onUndoPayment={undoFixedPayment} onAddInstallment={()=>{setEditingInstallmentGroup(null);setCommitmentModal('installment')}} onEditInstallment={editInstallmentGroup} onRemoveInstallment={removeInstallmentGroup} commitmentModal={commitmentModal} editingFixedExpense={editingFixedExpense} editingInstallmentGroup={editingInstallmentGroup} onCloseModal={()=>{setCommitmentModal(null);setEditingFixedExpense(null);setEditingInstallmentGroup(null)}} onSaveFixed={saveFixedExpense} onSaveInstallment={savePastInstallment}/>:
       <>{tab==='dashboard'&&<>
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-5">
           <Kpi title="Gasto no período" value={money(total)} note={period==='all'?'Somatório de todos os meses':`Orçamento: ${money(selectedBudget)}`}/>
           <Kpi title="Crédito utilizado" value={money(credit)} note={`${total?Math.round(credit/total*100):0}% do total`}/>
           <Kpi title="Débito / Pix" value={money(debit)} note={`${total?Math.round(debit/total*100):0}% do total`}/>
-          <Kpi title="Parcelas futuras" value={money(futureCommitted)} note={`${futureCommitments.length} parcela(s) após ${fmtMonth(selectedMonth)}`}/>
+          <Kpi title="Parcelas do próximo mês" value={money(futureCommitted)} note={`Valor integral · ${futureCommitments.length} compra(s) com parcela em ${fmtMonth(nextMonth)}`}/>
         </div>
         <section className="mb-6"><div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-3"><div><h2 className="font-bold text-[16px]" style={{fontFamily:'Manrope'}}>Suas instituições</h2><p className="text-xs muted mt-1">{dominant?.value?`Mais usada: ${dominant.name} · `:''}Gastos por modalidade · {periodLabel}</p></div></div><div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">{bankSummary.map(b=><div className={`card bank-card bank-${b.id} p-4`} key={b.id}><div className="flex items-center gap-2 mb-4"><span className="bank-indicator" style={{background:b.id==='bb'?'linear-gradient(135deg,#F8D117 50%,#0038A8 50%)':BANKS.find(bank=>bank.id===b.id)?.color||'#71717A'}}/><div className="font-bold text-sm">{b.name}</div><div className="ml-auto text-[10px] muted">MÊS</div></div><div className="grid grid-cols-1 xl:grid-cols-2 gap-3"><div><div className="text-[10px] uppercase tracking-wide muted mb-1">Débito / Pix</div><div className="font-semibold text-[15px] whitespace-nowrap">{money(b.debit)}</div></div><div><div className="text-[10px] uppercase tracking-wide muted mb-1">Na fatura</div><div className="font-semibold text-[15px] whitespace-nowrap">{money(b.credit)}</div></div></div></div>)}</div></section>
         <div className="grid grid-cols-1 xl:grid-cols-3 gap-4 mb-5">
@@ -574,12 +637,13 @@ function TransactionModal({banks,people,initial,onClose,onSave}){
   const [form,setForm]=useState(()=>initial?{
     ...initial,
     amount:String(initial.transactionTotal??initial.amount),
+    cardOwner:initial.cardOwner||'mine',
     installmentCount:initial.installmentCount||1,
     splitEnabled:Boolean(initial.sharedWithUserId),
     sharedWithUserId:initial.sharedWithUserId||'',
     splitMode:initial.sharedWithUserId?'amount':'equal',
     splitValue:initial.payerShare??initial.amount
-  }:{date:dateISO(new Date()),description:'',amount:'',category:'Alimentação',bank:'nubank',method:'debit',installmentCount:1,splitEnabled:false,sharedWithUserId:people[0]?.id||'',splitMode:'equal',splitValue:50})
+  }:{date:dateISO(new Date()),description:'',amount:'',category:'Alimentação',bank:'nubank',method:'debit',installmentCount:1,cardOwner:'mine',splitEnabled:false,sharedWithUserId:people[0]?.id||'',splitMode:'equal',splitValue:50})
   const update=(key,value)=>setForm(current=>({...current,[key]:value}))
   const totalAmount=Number(form.amount)||0
   const ownShare=form.splitMode==='percentage'?totalAmount*(Number(form.splitValue||0)/100):form.splitMode==='amount'?Number(form.splitValue||0):totalAmount/2
@@ -600,6 +664,7 @@ function TransactionModal({banks,people,initial,onClose,onSave}){
         <label className="text-xs font-semibold text-slate-600">Categoria<select className="field mt-1.5" value={form.category} onChange={event=>update('category',event.target.value)}>{CATEGORIES.map(category=><option key={category}>{category}</option>)}</select></label>
         <label className="text-xs font-semibold text-slate-600">Instituição<select className="field mt-1.5" value={form.bank} onChange={event=>update('bank',event.target.value)}>{banks.map(bank=><option key={bank.id} value={bank.id}>{bank.name}</option>)}</select></label>
         <label className="col-span-2 text-xs font-semibold text-slate-600">Forma de pagamento<div className="grid grid-cols-2 gap-2 mt-1.5"><button type="button" onClick={()=>update('method','debit')} className={`p-3 rounded-xl border text-sm font-semibold ${form.method==='debit'?'border-violet-400 bg-violet-50 text-violet-700':'border-slate-200 text-slate-500'}`}>Débito / Pix</button><button type="button" onClick={()=>update('method','credit')} className={`p-3 rounded-xl border text-sm font-semibold ${form.method==='credit'?'border-violet-400 bg-violet-50 text-violet-700':'border-slate-200 text-slate-500'}`}>Crédito</button></div></label>
+        {form.method==='credit'&&<label className="col-span-2 text-xs font-semibold text-slate-600">Cartão utilizado<select className="field mt-1.5" value={form.cardOwner} onChange={event=>update('cardOwner',event.target.value)}><option value="mine">Meu cartão</option><option value="other">Cartão de outra pessoa</option></select><span className="block mt-1 font-normal muted">Compras no cartão de outra pessoa não entram na fatura dos seus cartões.</span></label>}
         {form.method==='credit'&&<label className="col-span-2 text-xs font-semibold text-slate-600">Número de parcelas<select className="field mt-1.5" value={form.installmentCount} disabled={Boolean(initial?.installmentGroup)} onChange={event=>update('installmentCount',Number(event.target.value))}>{Array.from({length:24},(_,index)=><option key={index+1} value={index+1}>{index+1}x</option>)}</select>{initial?.installmentGroup&&<span className="block mt-1 font-normal muted">Esta compra já possui parcelas vinculadas.</span>}</label>}
         <label className="col-span-2 flex items-center gap-2 rounded-lg border border-slate-200 p-3 text-sm font-semibold"><input type="checkbox" checked={form.splitEnabled} disabled={!people.length} onChange={event=>{update('splitEnabled',event.target.checked);if(event.target.checked&&!form.sharedWithUserId&&people[0])update('sharedWithUserId',people[0].id)}}/>Dividir este gasto{!people.length&&<span className="ml-auto text-xs font-normal muted">Vincule alguém nas configurações</span>}</label>
         {form.splitEnabled&&<>
@@ -640,27 +705,41 @@ function FixedExpenseForm({initial,banks,defaultMonth,onClose,onSave}){
   </div>
 }
 
-function PastInstallmentForm({banks,defaultDate,onClose,onSave}){
-  const [form,setForm]=useState({description:'',amount:'',category:'Compras',bank:banks[0]?.id||'nubank',date:defaultDate,installmentCount:'6',currentInstallment:'1'})
+function PastInstallmentForm({banks,defaultDate,initial,onClose,onSave}){
+  const [form,setForm]=useState(()=>initial?{...initial,amount:String(initial.amount),installmentCount:String(initial.installmentCount),currentInstallment:String(initial.currentInstallment),cardOwner:initial.cardOwner||'mine'}:{description:'',amount:'',category:'Compras',bank:banks[0]?.id||'nubank',date:defaultDate,installmentCount:'6',currentInstallment:'1',cardOwner:'mine'})
+  const [amountMode,setAmountMode]=useState('total')
   const update=(key,value)=>setForm(current=>({...current,[key]:value}))
   const count=Number(form.installmentCount)||2
   const current=Math.min(count,Math.max(1,Number(form.currentInstallment)||1))
+  const enteredAmountCents=Math.round((Number(form.amount)||0)*100)
+  const totalAmount=amountMode==='installment'?enteredAmountCents*count/100:Number(form.amount)||0
+  const perInstallment=amountMode==='installment'?enteredAmountCents/100:Math.round(totalAmount*100/count)/100
   const lastMonth=form.date?shiftMonth(form.date.slice(0,7),count-current):''
-  function submit(event){event.preventDefault();if(!form.description.trim()||Number(form.amount)<=0)return;onSave({...form,description:form.description.trim(),amount:Number(form.amount),installmentCount:count,currentInstallment:current,method:'credit'})}
+  function changeAmountMode(nextMode){
+    if(nextMode===amountMode)return
+    const cents=Math.round((Number(form.amount)||0)*100)
+    const totalCents=amountMode==='total'?cents:cents*count
+    const converted=nextMode==='total'?totalCents:Math.round(totalCents/count)
+    setForm(value=>({...value,amount:form.amount?String((converted/100).toFixed(2)):'',amountMode:nextMode}))
+    setAmountMode(nextMode)
+  }
+  function submit(event){event.preventDefault();if(!form.description.trim()||totalAmount<=0)return;onSave({...form,description:form.description.trim(),amount:totalAmount,installmentCount:count,currentInstallment:current,method:'credit'})}
   return <div className="fixed inset-0 z-50 bg-slate-900/30 grid place-items-center p-4" onMouseDown={event=>{if(event.target===event.currentTarget)onClose()}}>
     <form onSubmit={submit} className="card w-full max-w-xl p-6 max-h-[92vh] overflow-y-auto">
-      <div className="flex items-start justify-between gap-4 mb-5"><div><h2 className="text-lg font-extrabold">Registrar compra parcelada</h2><p className="text-sm muted mt-1">Informe a parcela que será paga agora e a data do próximo vencimento.</p></div><button type="button" className="btn btn-light !p-2" onClick={onClose} aria-label="Fechar"><X size={17}/></button></div>
+      <div className="flex items-start justify-between gap-4 mb-5"><div><h2 className="text-lg font-extrabold">{initial?'Editar compra parcelada':'Registrar compra parcelada'}</h2><p className="text-sm muted mt-1">{initial?'Edite os dados da compra e o cronograma das parcelas restantes.':'Informe a parcela que será paga agora e a data do próximo vencimento.'}</p></div><button type="button" className="btn btn-light !p-2" onClick={onClose} aria-label="Fechar"><X size={17}/></button></div>
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <label className="sm:col-span-2 text-xs font-semibold muted">Descrição da compra<input required className="field mt-1.5" placeholder="Ex.: Geladeira" value={form.description} onChange={event=>update('description',event.target.value)}/></label>
-        <label className="text-xs font-semibold muted">Valor total da compra (R$)<input required type="number" min="0.01" step="0.01" className="field mt-1.5" placeholder="0,00" value={form.amount} onChange={event=>update('amount',event.target.value)}/></label>
+        <label className="text-xs font-semibold muted">Informar valor como<select className="field mt-1.5" value={amountMode} onChange={event=>changeAmountMode(event.target.value)}><option value="total">Valor total da compra</option><option value="installment">Valor de cada parcela</option></select></label>
+        <label className="text-xs font-semibold muted">{amountMode==='total'?'Valor total da compra (R$)':'Valor de cada parcela (R$)'}<input required type="number" min="0.01" step="0.01" className="field mt-1.5" placeholder="0,00" value={form.amount} onChange={event=>update('amount',event.target.value)}/></label>
         <label className="text-xs font-semibold muted">Instituição<select className="field mt-1.5" value={form.bank} onChange={event=>update('bank',event.target.value)}>{banks.map(bank=><option key={bank.id} value={bank.id}>{bank.name}</option>)}</select></label>
+        <label className="text-xs font-semibold muted">Cartão utilizado<select className="field mt-1.5" value={form.cardOwner} onChange={event=>update('cardOwner',event.target.value)}><option value="mine">Meu cartão</option><option value="other">Cartão de outra pessoa</option></select></label>
         <label className="text-xs font-semibold muted">Categoria<select className="field mt-1.5" value={form.category} onChange={event=>update('category',event.target.value)}>{CATEGORIES.map(category=><option key={category}>{category}</option>)}</select></label>
         <label className="text-xs font-semibold muted">Total de parcelas<select className="field mt-1.5" value={form.installmentCount} onChange={event=>setForm(currentForm=>({ ...currentForm,installmentCount:event.target.value,currentInstallment:String(Math.min(Number(currentForm.currentInstallment),Number(event.target.value))) }))}>{Array.from({length:23},(_,index)=>index+2).map(count=><option key={count} value={count}>{count}x</option>)}</select></label>
         <label className="text-xs font-semibold muted">Parcela atual<select className="field mt-1.5" value={current} onChange={event=>update('currentInstallment',event.target.value)}>{Array.from({length:count},(_,index)=>index+1).map(number=><option key={number} value={number}>{number}/{count}</option>)}</select></label>
         <label className="sm:col-span-2 text-xs font-semibold muted">Data da próxima parcela<input required type="date" className="field mt-1.5" value={form.date} onChange={event=>update('date',event.target.value)}/></label>
       </div>
-      <div className="rounded-lg bg-slate-50 p-4 mt-4 text-sm">Serão registradas as parcelas de <strong>{current}/{count}</strong> até <strong>{count}/{count}</strong>. Previsão de término: <strong className="capitalize">{lastMonth?fmtMonth(lastMonth):'—'}</strong>.</div>
-      <div className="flex justify-end gap-2 mt-6"><button type="button" className="btn btn-light" onClick={onClose}>Cancelar</button><button className="btn btn-primary" type="submit">Salvar parcelas</button></div>
+      <div className="rounded-lg bg-slate-50 p-4 mt-4 text-sm">Total da compra: <strong>{money(totalAmount)}</strong> · Cada parcela: <strong>{money(perInstallment)}</strong>. {initial?'Serão atualizadas':'Serão registradas'} as parcelas de <strong>{current}/{count}</strong> até <strong>{count}/{count}</strong>. Previsão de término: <strong className="capitalize">{lastMonth?fmtMonth(lastMonth):'—'}</strong>.</div>
+      <div className="flex justify-end gap-2 mt-6"><button type="button" className="btn btn-light" onClick={onClose}>Cancelar</button><button className="btn btn-primary" type="submit">{initial?'Salvar compra':'Salvar parcelas'}</button></div>
     </form>
   </div>
 }
@@ -669,7 +748,7 @@ function monthSelectOptions(anchor){
   return Array.from({length:61},(_,index)=>shiftMonth(anchor,index-12))
 }
 
-function Commitments({data,banks,month,theme,paidFixedExpenseIds,onAddFixed,onEditFixed,onDeleteFixed,onMarkPaid,onUndoPayment,onAddInstallment,onEditInstallment,onRemoveInstallment,commitmentModal,editingFixedExpense,onCloseModal,onSaveFixed,onSaveInstallment}){
+function Commitments({data,banks,month,theme,paidFixedExpenseIds,onAddFixed,onEditFixed,onDeleteFixed,onMarkPaid,onUndoPayment,onAddInstallment,onEditInstallment,onRemoveInstallment,commitmentModal,editingFixedExpense,editingInstallmentGroup,onCloseModal,onSaveFixed,onSaveInstallment}){
   const fixed=(data.fixedExpenses||[]).filter(expense=>expenseActiveInMonth(expense,month))
   const fixedTotal=fixed.reduce((sum,expense)=>sum+Number(expense.amount||0),0)
   const unpaid=fixed.filter(expense=>!paidFixedExpenseIds.has(expense.id)).reduce((sum,expense)=>sum+Number(expense.amount||0),0)
@@ -688,26 +767,21 @@ function Commitments({data,banks,month,theme,paidFixedExpenseIds,onAddFixed,onEd
     <section className="card p-5 sm:p-6">
       <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4 mb-5"><div><h2 className="text-lg font-bold">Compras parceladas em andamento</h2><p className="text-sm muted mt-1">Registre compras que começaram antes do uso do sistema e veja quando a última parcela vence.</p></div><button className="btn btn-primary btn-register-installment" onClick={onAddInstallment}><Plus size={15}/>Registrar compra</button></div>
       {installmentGroups.length?<div className="divide-y divide-slate-100">{installmentGroups.map(group=>{
-        const rows=group.rows
+        const rows=[...group.rows].sort((a,b)=>Number(a.installmentNumber)-Number(b.installmentNumber))
+        const totalCount=Math.max(...rows.map(row=>Number(row.installmentCount)||0),...rows.map(row=>Number(row.installmentNumber)||0))
         const last=rows[rows.length-1]
         const upcoming=rows.filter(row=>monthKey(row.date)>=month)
-        const next=upcoming[0]
+        const next=upcoming.sort((a,b)=>Number(a.installmentNumber)-Number(b.installmentNumber))[0]
         const first=rows[0]
         return <article key={group.id} className="py-4 grid grid-cols-1 md:grid-cols-[1fr_auto] gap-3">
-          <div><div className="flex items-center flex-wrap gap-2"><h3 className="font-semibold">{first.description}</h3><span className="category-badge" style={categoryStyle(first.category,theme)}>{first.category}</span></div><p className="text-xs muted mt-1">{installmentName(first)} · {money(first.installmentTotal||first.transactionTotal||first.amount)} no total · {money(first.amount)} por mês</p></div>
-          <div className="md:text-right">{next?<><div className="font-semibold">{next.installmentNumber}/{next.installmentCount} · próxima parcela</div><div className="text-xs muted mt-1">{installmentDisplayDate(next.date)} · termina em {installmentDisplayDate(last.date)}</div><div className="text-xs muted mt-1">{upcoming.length} parcela(s) em aberto</div></>:<><div className="font-semibold">Parcelamento finalizado</div><div className="text-xs muted mt-1">Última parcela em {installmentDisplayDate(last.date)}</div></>}</div>
-          <details className="md:col-span-2 border-t border-slate-100">
-            <summary className="cursor-pointer py-3 text-sm font-semibold">Ver todas as parcelas ({rows.length})</summary>
-            <div className="divide-y divide-slate-100">{rows.map(row=><div key={row.id} className="py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-              <div><div className="text-sm font-semibold">Parcela {row.installmentNumber}/{row.installmentCount}</div><div className="text-xs muted mt-1">{installmentDisplayDate(row.date)} · {money(row.amount)}</div></div>
-              <div className="flex gap-2"><button type="button" className="btn btn-light" onClick={()=>onEditInstallment(row)}><Pencil size={14}/>Editar</button><button type="button" className="btn btn-light" onClick={()=>onRemoveInstallment(row.id)}><Trash2 size={14}/>Excluir</button></div>
-            </div>)}</div>
-          </details>
+          <div><div className="flex items-center flex-wrap gap-2"><h3 className="font-semibold">{first.description}</h3><span className="category-badge" style={categoryStyle(first.category,theme)}>{first.category}</span>{first.cardOwner==='other'&&<span className="inline-flex rounded-md bg-slate-100 px-2 py-1 text-[10px] font-semibold">Cartão de outra pessoa</span>}</div><p className="text-xs muted mt-1">{installmentName(first)} · {money(first.installmentTotal||first.transactionTotal||first.amount)} no total · Parcela: {money(first.transactionTotal||first.amount)}{first.isShared?` · sua parte: ${money(first.amount)}`:''}</p></div>
+          <div className="md:text-right">{next?<><div className="font-semibold">{next.installmentNumber}/{totalCount} · próxima parcela</div><div className="text-xs muted mt-1">{installmentDisplayDate(next.date)} · termina em {installmentDisplayDate(last.date)}</div><div className="text-xs muted mt-1">{upcoming.length} parcela(s) em aberto</div></>:<><div className="font-semibold">Parcelamento finalizado</div><div className="text-xs muted mt-1">Última parcela em {installmentDisplayDate(last.date)}</div></>}</div>
+          {first.isPayer!==false&&<div className="md:col-span-2 border-t border-slate-100 pt-3 flex flex-wrap justify-end gap-2"><button className="btn btn-light" onClick={()=>onEditInstallment(group)}><Pencil size={14}/>Editar compra</button><button className="btn btn-light" onClick={()=>onRemoveInstallment(group)}><Trash2 size={14}/>Remover compra</button></div>}
         </article>
       })}</div>:<div className="border-t border-slate-100 py-8 text-center"><p className="font-semibold">Nenhuma compra parcelada registrada</p><p className="text-sm muted mt-1">Inclua uma compra em andamento para acompanhar as parcelas restantes.</p></div>}
     </section>
     {commitmentModal==='fixed'&&<FixedExpenseForm key={editingFixedExpense?.id||'new-fixed'} initial={editingFixedExpense} banks={banks} defaultMonth={month} onClose={onCloseModal} onSave={onSaveFixed}/>}
-    {commitmentModal==='installment'&&<PastInstallmentForm banks={banks} defaultDate={month===currentKey?dateISO(new Date()):`${month}-01`} onClose={onCloseModal} onSave={onSaveInstallment}/>}
+    {commitmentModal==='installment'&&<PastInstallmentForm key={editingInstallmentGroup?.id||'new-installment'} banks={banks} defaultDate={month===currentKey?dateISO(new Date()):`${month}-01`} initial={editingInstallmentGroup?.initial} onClose={onCloseModal} onSave={onSaveInstallment}/>}
   </div>
 }
 

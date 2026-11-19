@@ -111,6 +111,7 @@ export async function loadFinanceData(userId) {
         installmentNumber: row.installment_number ?? undefined,
         installmentCount: row.installment_count ?? undefined,
         installmentGroup: row.installment_group_id ?? undefined,
+        cardOwner:row.card_owner||'mine',
         fixedExpenseId:row.fixed_expense_id||undefined,
         createdAt: row.created_at ? new Date(row.created_at).getTime() : Date.now()
       }
@@ -210,7 +211,7 @@ function transactionRow(item, userId) {
     amount: transactionTotal, category: item.category || 'Outros', bank: item.bank || 'nubank',
     method: item.method || 'debit', installment_group_id: item.installmentGroup || null,
     installment_number: item.installmentNumber ?? null, installment_count: item.installmentCount ?? null,
-    installment_total: item.installmentTotal ?? null, fixed_expense_id:item.fixedExpenseId||null,
+    installment_total: item.installmentTotal ?? null, card_owner:item.cardOwner||'mine',fixed_expense_id:item.fixedExpenseId||null,
     created_at: item.createdAt ? new Date(item.createdAt).toISOString() : new Date().toISOString()
   }
 }
@@ -261,7 +262,10 @@ export async function syncFinanceData(userId, before, after) {
   const removedTransactionIds = [...oldTransactions.keys()].filter(id => !newTransactions.has(id))
   if (changedTransactions.length) {
     const { error } = await supabase.from('transactions').upsert(changedTransactions.map(item => transactionRow(item, userId)))
-    if (error) throw error
+    if (error) {
+      if(/card_owner/i.test(error.message||''))throw new Error('Atualize o Supabase executando supabase/migrations/20261119_card_owner.sql no SQL Editor.')
+      throw error
+    }
   }
   if (removedTransactionIds.length) {
     const { error } = await supabase.from('transactions').delete().eq('user_id', userId).in('id', removedTransactionIds)

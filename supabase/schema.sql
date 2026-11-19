@@ -12,6 +12,7 @@ create table if not exists public.transactions (
   installment_number smallint,
   installment_count smallint,
   installment_total numeric(12,2),
+  card_owner text not null default 'mine' check (card_owner in ('mine','other')),
   payer_id uuid references auth.users(id) on delete cascade,
   shared_with_user_id uuid references auth.users(id) on delete set null,
   payer_share numeric(12,2),
@@ -30,6 +31,12 @@ alter table public.transactions add column if not exists payer_share numeric(12,
 alter table public.transactions add column if not exists shared_share numeric(12,2) not null default 0;
 alter table public.transactions add column if not exists settled_at timestamptz;
 alter table public.transactions add column if not exists settled_by uuid references auth.users(id) on delete set null;
+alter table public.transactions add column if not exists card_owner text not null default 'mine';
+do $$ begin
+  if not exists (select 1 from pg_constraint where conrelid='public.transactions'::regclass and conname='transactions_card_owner_check') then
+    alter table public.transactions add constraint transactions_card_owner_check check (card_owner in ('mine','other'));
+  end if;
+end $$;
 update public.transactions set payer_id = user_id where payer_id is null;
 update public.transactions set payer_share = amount where payer_share is null;
 alter table public.transactions alter column payer_id set default auth.uid();
